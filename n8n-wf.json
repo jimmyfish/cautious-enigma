@@ -1,0 +1,488 @@
+{
+    "nodes": [
+      {
+        "parameters": {},
+        "id": "ff692521-9a32-4991-9580-70287f0efa76",
+        "name": "Manual Trigger",
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [
+          368,
+          640
+        ]
+      },
+      {
+        "parameters": {
+          "values": {
+            "string": [
+              {
+                "name": "symbol",
+                "value": "BBCA"
+              },
+              {
+                "name": "sbAuth",
+                "value": "=Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6IjU3MDc0NjI3LTg4MWItNDQzZC04OTcyLTdmMmMzOTNlMzYyOSIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7InVzZSI6ImRpdG9sYWtzb25veXAiLCJlbWEiOiJraWxsY29kZXIyMTJAZ21haWwuY29tIiwiZnVsIjoiRGl0byBZUCIsInNlcyI6Im1jdXZPRWg5SnNIYm85bW8iLCJkdmMiOiI2Y2UzYjViZWE3YTc4YjJiNjJlODQ4NjdhYzQyNDQwMCIsInVpZCI6OTE0NzY2LCJjb3UiOiJTRyJ9LCJleHAiOjE3NjU5MDE3NjMsImlhdCI6MTc2NTgxNTM2MywiaXNzIjoiU1RPQ0tCSVQiLCJqdGkiOiI2ZDBlNWQ4MS00NWEzLTQ5NTUtOGI3MC1lY2U0NDg3ZWU5MzYiLCJuYmYiOjE3NjU4MTUzNjMsInZlciI6InYxIn0.DZf-m7rvd_C2OJ5Qgvhxi0PuonN8cH8cfNrV9y0ee1PW5TS2IT7j5Wkv5uiwxMM6Zx2ioVfFZ1GDzUs-5J1A8fBoVBh6Gplr2zFsRM7TgxFWQrNGoZWuKNvovpLJMShAPfwlAM_4I7gLXR_hxDYUsuKK1CcSBDF42N3exdl5O2Wm9rcbzMT8YXiGtN5_0OZ2aZwASwwGbAo739O9rW58FNB39aikhqdzCc_W1vpF3mK5uCgDJbRm9rR_rxu4rx7yas7sRMI3J7M6VylkwZtR8KOxRYjxYBttvJ_AVUui3LZofP2Cd2_MNEmd5D856NI1NiMQ38IWUiluUjIAViNiFw"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "ad975551-8e88-47ba-8d7f-ddca9e1db622",
+        "name": "Set Input (symbol + sbAuth)",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 2,
+        "position": [
+          592,
+          640
+        ]
+      },
+      {
+        "parameters": {
+          "url": "=https://exodus.stockbit.com/marketdetectors/{{$json[\"symbol\"]}}?transaction_type=TRANSACTION_TYPE_NET&market_board=MARKET_BOARD_REGULER&investor_type=INVESTOR_TYPE_ALL&limit=25",
+          "options": {},
+          "headerParametersUi": {
+            "parameter": [
+              {
+                "name": "Accept",
+                "value": "application/json"
+              },
+              {
+                "name": "Authorization",
+                "value": "={{$json[\"sbAuth\"]}}"
+              },
+              {
+                "name": "User-Agent",
+                "value": "Mozilla/5.0"
+              },
+              {
+                "name": "Origin",
+                "value": "https://stockbit.com"
+              },
+              {
+                "name": "Accept-Language",
+                "value": "en-GB,en-US;q=0.9,en;q=0.8"
+              },
+              {
+                "name": "Referer",
+                "value": "https://stockbit.com/"
+              }
+            ]
+          }
+        },
+        "id": "b17102db-1921-442b-807f-ac825c8fb061",
+        "name": "HTTP Market Detector",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 2,
+        "position": [
+          816,
+          352
+        ]
+      },
+      {
+        "parameters": {
+          "url": "=https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/{{$json[\"symbol\"]}}",
+          "options": {},
+          "headerParametersUi": {
+            "parameter": [
+              {
+                "name": "Accept",
+                "value": "application/json"
+              },
+              {
+                "name": "Authorization",
+                "value": "={{$json[\"sbAuth\"]}}"
+              },
+              {
+                "name": "User-Agent",
+                "value": "Mozilla/5.0"
+              },
+              {
+                "name": "Origin",
+                "value": "https://stockbit.com"
+              },
+              {
+                "name": "Accept-Language",
+                "value": "EN"
+              },
+              {
+                "name": "Referer",
+                "value": "https://stockbit.com/"
+              }
+            ]
+          }
+        },
+        "id": "21754490-2f27-4bfa-9cb2-1b7a9edbcffa",
+        "name": "HTTP Price Feed",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 2,
+        "position": [
+          816,
+          544
+        ]
+      },
+      {
+        "parameters": {
+          "url": "=https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/{{$json[\"symbol\"]}}",
+          "options": {},
+          "headerParametersUi": {
+            "parameter": [
+              {
+                "name": "Accept",
+                "value": "application/json"
+              },
+              {
+                "name": "Authorization",
+                "value": "={{$json[\"sbAuth\"]}}"
+              },
+              {
+                "name": "User-Agent",
+                "value": "Mozilla/5.0"
+              },
+              {
+                "name": "Origin",
+                "value": "https://stockbit.com"
+              },
+              {
+                "name": "Accept-Language",
+                "value": "EN"
+              },
+              {
+                "name": "Referer",
+                "value": "https://stockbit.com/"
+              }
+            ]
+          }
+        },
+        "id": "eecb59c9-34df-48a8-b581-7781d15ee84b",
+        "name": "HTTP Orderbook (alias)",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 2,
+        "position": [
+          816,
+          736
+        ]
+      },
+      {
+        "parameters": {
+          "url": "=https://exodus.stockbit.com/order-trade/running-trade/chart/{{$json[\"symbol\"]}}?period=RT_PERIOD_LAST_1_DAY",
+          "options": {},
+          "headerParametersUi": {
+            "parameter": [
+              {
+                "name": "Accept",
+                "value": "application/json"
+              },
+              {
+                "name": "Authorization",
+                "value": "={{$json[\"sbAuth\"]}}"
+              },
+              {
+                "name": "User-Agent",
+                "value": "Mozilla/5.0"
+              },
+              {
+                "name": "Origin",
+                "value": "https://stockbit.com"
+              },
+              {
+                "name": "Accept-Language",
+                "value": "EN"
+              },
+              {
+                "name": "Referer",
+                "value": "https://stockbit.com/"
+              }
+            ]
+          }
+        },
+        "id": "620efcd1-23a7-4496-8f0c-b7b0c1c49610",
+        "name": "HTTP Running Trade",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 2,
+        "position": [
+          816,
+          928
+        ]
+      },
+      {
+        "parameters": {
+          "url": "=https://exodus.stockbit.com/order-trade/running-trade?sort=DESC&limit=50&order_by=RUNNING_TRADE_ORDER_BY_TIME&symbols%5B%5D={{$json[\"symbol\"]}}",
+          "options": {},
+          "headerParametersUi": {
+            "parameter": [
+              {
+                "name": "Accept",
+                "value": "application/json"
+              },
+              {
+                "name": "Authorization",
+                "value": "={{ $('Set Input (symbol + sbAuth)').item.json.sbAuth }}"
+              },
+              {
+                "name": "User-Agent",
+                "value": "Mozilla/5.0"
+              },
+              {
+                "name": "Origin",
+                "value": "https://stockbit.com"
+              },
+              {
+                "name": "Accept-Language",
+                "value": "EN"
+              },
+              {
+                "name": "Referer",
+                "value": "https://stockbit.com/"
+              }
+            ]
+          }
+        },
+        "id": "ab9530fc-a587-4e58-a7c8-c9ee1ba4c023",
+        "name": "HTTP Today Running Trade",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 2,
+        "position": [
+          816,
+          160
+        ]
+      },
+      {
+        "parameters": {
+          "url": "=https://exodus.stockbit.com/findata-view/foreign-domestic/v1/chart-data/{{ $('Set Input (symbol + sbAuth)').item.json.symbol }}?market_type=MARKET_TYPE_REGULAR&period=PERIOD_RANGE_1D",
+          "options": {},
+          "headerParametersUi": {
+            "parameter": [
+              {
+                "name": "Accept",
+                "value": "application/json"
+              },
+              {
+                "name": "Authorization",
+                "value": "={{ $('Set Input (symbol + sbAuth)').item.json.sbAuth }}"
+              },
+              {
+                "name": "User-Agent",
+                "value": "Mozilla/5.0"
+              },
+              {
+                "name": "Origin",
+                "value": "https://stockbit.com"
+              },
+              {
+                "name": "Accept-Language",
+                "value": "EN"
+              },
+              {
+                "name": "Referer",
+                "value": "https://stockbit.com/"
+              }
+            ]
+          }
+        },
+        "id": "2bc264ff-8d84-488d-807e-056220b57bec",
+        "name": "HTTP Findata",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 2,
+        "position": [
+          816,
+          1120
+        ]
+      },
+      {
+        "parameters": {
+          "values": {
+            "string": [
+              {
+                "name": "symbol",
+                "value": "={{ $('Set Input (symbol + sbAuth)').item.json.symbol }}"
+              },
+              {
+                "name": "percentage_change",
+                "value": "={{$json[\"price_feed\"].data.percentage_change}}"
+              },
+              {
+                "name": "foreign_net",
+                "value": "={{$json[\"price_feed\"].data.fnet}}"
+              },
+              {
+                "name": "spread",
+                "value": "={{$json[\"price_feed\"].data.offer[0].price - $json[\"price_feed\"].data.bid[0].price}}"
+              },
+              {
+                "name": "depth_bid_total_volume",
+                "value": "={{$json[\"price_feed\"].data.bid.reduce((acc, l) => acc + (Number(l.volume) || 0), 0)}}"
+              },
+              {
+                "name": "depth_offer_total_volume",
+                "value": "={{$json[\"price_feed\"].data.offer.reduce((acc, l) => acc + (Number(l.volume) || 0), 0)}}"
+              },
+              {
+                "name": "trade_count",
+                "value": "={{$json[\"today_running_trade\"].data.running_trade.length}}"
+              },
+              {
+                "name": "net_foreign_findata",
+                "value": "={{$json[\"findata\"].data.summary.net_foreign.value.raw}}"
+              },
+              {
+                "name": "analysis_markdown",
+                "value": "=# Market Analysis Report\\n**Symbol**: {{$json[\"symbol\"]}}\\n**Analysis Date**: {{$now}}\\n**Data Sources**: market-detector, price-feed, orderbook, running-trade, today-running-trade, findata\\n**Order Book Source**: price-feed.json (HTTP)\\n\\n---\\n\\n## Executive Summary\\n\\n- Daily percentage change: **{{$json[\"percentage_change\"]}}**.\\n- Order book spread: **{{$json[\"spread\"]}}**.\\n- Net foreign from price feed: **{{$json[\"foreign_net\"]}}**, from findata: **{{$json[\"net_foreign_findata\"]}}**.\\n- Bid vs offer depth (total volume): **{{$json[\"depth_bid_total_volume\"]}}** vs **{{$json[\"depth_offer_total_volume\"]}}**.\\n- Total trades today (running trade): **{{$json[\"trade_count\"]}}**.\\n\\n---\\n\\n## Notes\\n\\n- This report uses pre-computed metrics from upstream APIs and simple aggregations via n8n expressions.\\n- For deeper metrics (trend slope, intraday volatility, etc.), use an external analytics service or LLM fed with the full JSON payload.\\n"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "bfbb6a3c-4b87-4713-9c13-9d3d1f77fc22",
+        "name": "Set Analytics & Markdown",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 2,
+        "position": [
+          1264,
+          640
+        ]
+      },
+      {
+        "parameters": {
+          "numberInputs": 6
+        },
+        "type": "n8n-nodes-base.merge",
+        "typeVersion": 3.2,
+        "position": [
+          1040,
+          576
+        ],
+        "id": "c8ec32bb-5ea6-4909-b6c5-b6dd8aa95b8f",
+        "name": "Merge"
+      }
+    ],
+    "connections": {
+      "Manual Trigger": {
+        "main": [
+          [
+            {
+              "node": "Set Input (symbol + sbAuth)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Set Input (symbol + sbAuth)": {
+        "main": [
+          [
+            {
+              "node": "HTTP Market Detector",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "HTTP Price Feed",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "HTTP Orderbook (alias)",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "HTTP Running Trade",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "HTTP Today Running Trade",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "HTTP Findata",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "HTTP Market Detector": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 1
+            }
+          ]
+        ]
+      },
+      "HTTP Price Feed": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 2
+            }
+          ]
+        ]
+      },
+      "HTTP Orderbook (alias)": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 3
+            }
+          ]
+        ]
+      },
+      "HTTP Running Trade": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 4
+            }
+          ]
+        ]
+      },
+      "HTTP Today Running Trade": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "HTTP Findata": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 5
+            }
+          ]
+        ]
+      },
+      "Merge": {
+        "main": [
+          [
+            {
+              "node": "Set Analytics & Markdown",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {},
+    "meta": {
+      "instanceId": "d47f7433be5c22e0fdd48d1173f30e18bd270bae1b4e7a66c6ed7413b9fb0b9e"
+    }
+  }

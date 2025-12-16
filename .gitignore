@@ -1,0 +1,4 @@
+sources/
+.env
+**/*.json
+!n8n-wf.json
