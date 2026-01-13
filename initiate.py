@@ -6,6 +6,7 @@ import json
 import re
 import requests
 from pathlib import Path
+from datetime import date, timedelta
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -62,12 +63,19 @@ def main():
         "findata.json",
     ]
 
+    # Dynamic date range: from today - 7 days until today (inclusive)
+    today = date.today()
+    from_date = today - timedelta(days=7)
+    from_str = from_date.strftime("%Y-%m-%d")
+    to_str = today.strftime("%Y-%m-%d")
+
     market_url = (
         f"https://exodus.stockbit.com/marketdetectors/{symbol}"
-        "?transaction_type=TRANSACTION_TYPE_NET"
-        "&market_board=MARKET_BOARD_REGULER"
-        "&investor_type=INVESTOR_TYPE_ALL"
-        "&limit=25"
+        f"?transaction_type=TRANSACTION_TYPE_NET"
+        f"&from={from_str}&to={to_str}"
+        f"&market_board=MARKET_BOARD_REGULER"
+        f"&investor_type=INVESTOR_TYPE_FOREIGN"
+        f"&limit=25"
     )
 
     price_feed_url = f"https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/{symbol}"
@@ -81,12 +89,12 @@ def main():
     # Using proper URL encoding: symbols[] -> symbols%5B%5D
     today_running_trade_url = (
         f"https://exodus.stockbit.com/order-trade/running-trade"
-        f"?sort=DESC&limit=50&order_by=RUNNING_TRADE_ORDER_BY_TIME&symbols%5B%5D={symbol}"
+        f"?sort=DESC&limit=100&order_by=RUNNING_TRADE_ORDER_BY_TIME&symbols%5B%5D={symbol}"
     )
 
     findata_url = (
         f"https://exodus.stockbit.com/findata-view/foreign-domestic/v1/chart-data/{symbol}"
-        f"?market_type=MARKET_TYPE_REGULAR&period=PERIOD_RANGE_1D"
+        f"?market_type=MARKET_TYPE_REGULAR&period=PERIOD_RANGE_1M"
     )
 
     headers = {

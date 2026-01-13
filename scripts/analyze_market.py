@@ -311,7 +311,44 @@ def summarize_market_detector(data: dict) -> dict:
     md = data.get("data", {})
     bandar = md.get("bandar_detector", {}) or {}
     broker_summary = md.get("broker_summary", {}) or {}
-    return {
+
+    total_buyer = bandar.get("total_buyer")
+    total_seller = bandar.get("total_seller")
+    net_brokers = None
+    dominant_side = None
+    if isinstance(total_buyer, (int, float)) and isinstance(total_seller, (int, float)):
+        net_brokers = total_buyer - total_seller
+        if net_brokers > 0:
+            dominant_side = "buyers"
+        elif net_brokers < 0:
+            dominant_side = "sellers"
+        else:
+            dominant_side = "balanced"
+
+    # Focus specifically on foreign (e.g. "Asing") buying activity
+    brokers_buy = broker_summary.get("brokers_buy", []) or []
+    foreign_buyers = [
+        b for b in brokers_buy if str(b.get("type", "")).lower() in {"asing", "foreign", "foreigner"}
+    ]
+    total_foreign_buy_volume = 0.0
+    total_foreign_buy_value = 0.0
+    for b in foreign_buyers:
+        vol_raw = b.get("blot") or b.get("blotv")
+        val_raw = b.get("bval") or b.get("bvalv")
+        vol = parse_numeric_string(vol_raw)
+        val = parse_numeric_string(val_raw)
+        if vol is not None:
+            total_foreign_buy_volume += vol
+        if val is not None:
+            total_foreign_buy_value += val
+
+    foreign_focus = {
+        "total_foreign_buy_volume": total_foreign_buy_volume or None,
+        "total_foreign_buy_value": total_foreign_buy_value or None,
+        "top_foreign_buyers": foreign_buyers[:5],
+    }
+
+    summary = {
         "from": md.get("from"),
         "to": md.get("to"),
         "bandar": {
@@ -320,14 +357,18 @@ def summarize_market_detector(data: dict) -> dict:
             "top3": bandar.get("top3"),
             "top5": bandar.get("top5"),
             "top10": bandar.get("top10"),
-            "total_buyer": bandar.get("total_buyer"),
-            "total_seller": bandar.get("total_seller"),
+            "total_buyer": total_buyer,
+            "total_seller": total_seller,
+            "net_brokers": net_brokers,
+            "dominant_side": dominant_side,
             "value": bandar.get("value"),
             "volume": bandar.get("volume"),
         },
         "top_buyers": broker_summary.get("brokers_buy", [])[:5],
         "top_sellers": broker_summary.get("brokers_sell", [])[:5],
+        "foreign_focus": foreign_focus,
     }
+    return summary
 
 
 def summarize_findata(data: dict) -> dict:
@@ -424,6 +465,33 @@ def summarize_findata(data: dict) -> dict:
             if key in frequency_section:
                 summary["frequency"][key] = extract_value_with_percentage(frequency_section[key])
     
+    # High-level participation snapshots to make the report easier to write
+    def extract_participation(section: dict) -> Optional[dict]:
+        if not section:
+            return None
+        foreign_total = section.get("foreign_total", {})
+        domestic_total = section.get("domestic_total", {})
+        ft_pct = (foreign_total.get("percentage") or {}).get("raw")
+        dt_pct = (domestic_total.get("percentage") or {}).get("raw")
+        if ft_pct is None and dt_pct is None:
+            return None
+        return {
+            "foreign_pct": ft_pct,
+            "domestic_pct": dt_pct,
+        }
+
+    value_participation = extract_participation(summary.get("value", {}))
+    if value_participation:
+        summary["value_participation"] = value_participation
+
+    volume_participation = extract_participation(summary.get("volume", {}))
+    if volume_participation:
+        summary["volume_participation"] = volume_participation
+
+    frequency_participation = extract_participation(summary.get("frequency", {}))
+    if frequency_participation:
+        summary["frequency_participation"] = frequency_participation
+
     return summary
 
 
@@ -435,41 +503,77 @@ def build_summary(base_dir: Path) -> dict:
     orderbook = load_json(base_dir / "orderbook.json")
     findata = load_json(base_dir / "findata.json")
 
+    symbol = base_dir.parent.name
+    session = base_dir.name
+
     orderbook_source: Optional[str] = None
     if orderbook:
         orderbook_source = "orderbook.json"
     elif price_feed and price_feed.get("data", {}).get("bid") and price_feed.get("data", {}).get("offer"):
         orderbook_source = "price-feed.json"
 
+    available_files = sorted(p.name for p in base_dir.glob("*.json"))
+    sources_analyzed = [
+        name
+        for name, data in [
+            ("price-feed.json", price_feed),
+            ("running-trade.json", running_trade),
+            ("today-running-trade.json", today_running_trade),
+            ("market-detector.json", market_detector),
+            ("orderbook.json", orderbook if orderbook_source == "orderbook.json" else price_feed if orderbook_source == "price-feed.json" else None),
+            ("findata.json", findata),
+        ]
+        if data is not None
+    ]
+    missing_sources = [
+        name
+        for name, data in [
+            ("price-feed.json", price_feed),
+            ("running-trade.json", running_trade),
+            ("today-running-trade.json", today_running_trade),
+            ("market-detector.json", market_detector),
+            (
+                "orderbook.json",
+                orderbook if orderbook_source == "orderbook.json" else price_feed if orderbook_source == "price-feed.json" else None,
+            ),
+            ("findata.json", findata),
+        ]
+        if data is None
+    ]
+
+    md_summary = summarize_market_detector(market_detector) if market_detector else None
+    fd_summary = summarize_findata(findata) if findata else None
+
     summary = {
         "metadata": {
+            "symbol": symbol,
+            "session": session,
             "base_dir": str(base_dir),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "available_files": sorted(p.name for p in base_dir.glob("*.json")),
+            "available_files": available_files,
+            "sources_analyzed": sources_analyzed,
             "orderbook_source": orderbook_source,
+            "missing_sources": missing_sources,
+            "time_horizons": {
+                "market_detector": {
+                    "from": md_summary.get("from") if md_summary else None,
+                    "to": md_summary.get("to") if md_summary else None,
+                },
+                "findata": {
+                    "from": fd_summary.get("from") if fd_summary else None,
+                    "to": fd_summary.get("to") if fd_summary else None,
+                    "date_range": fd_summary.get("date_range") if fd_summary else None,
+                },
+            },
         },
         "price_feed": summarize_price_feed(price_feed) if price_feed else None,
         "depth": summarize_depth(price_feed if orderbook_source == "price-feed.json" else orderbook) if price_feed or orderbook else None,
         "price_series": summarize_price_series(running_trade) if running_trade else None,
         "running_trade": summarize_running_trades(today_running_trade) if today_running_trade else None,
         "broker_chart": summarize_broker_charts(running_trade) if running_trade else None,
-        "market_detector": summarize_market_detector(market_detector) if market_detector else None,
-        "findata": summarize_findata(findata) if findata else None,
-        "missing_sources": [
-            name
-            for name, data in [
-                ("price-feed.json", price_feed),
-                ("running-trade.json", running_trade),
-                ("today-running-trade.json", today_running_trade),
-                ("market-detector.json", market_detector),
-                (
-                    "orderbook.json",
-                    orderbook if orderbook_source == "orderbook.json" else price_feed if orderbook_source == "price-feed.json" else None,
-                ),
-                ("findata.json", findata),
-            ]
-            if data is None
-        ],
+        "market_detector": md_summary,
+        "findata": fd_summary,
+        "missing_sources": missing_sources,
     }
     return summary
 
