@@ -2,3 +2,6 @@ sources/
 .env
 **/*.json
 !n8n-wf.json
+lightning_logs/
+*.csv
+*.png
