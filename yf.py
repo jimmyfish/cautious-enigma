@@ -212,11 +212,15 @@ class YFinanceForecaster:
         print(f"  Horizon: {self.horizon} periods")
         print(f"  Lookback: {input_size} periods")
         print(f"  Interval: {self.interval}")
+        print(f"  Exog features: {features}")
 
+        # NBEATS doesn't support exogenous variables, use only for NHITS and LSTM
         models = [
             NBEATS(h=self.horizon, input_size=input_size, max_steps=300, scaler_type="robust", random_seed=42),
-            NHITS(h=self.horizon, input_size=input_size, max_steps=300, scaler_type="robust", random_seed=42),
-            LSTM(h=self.horizon, input_size=input_size, max_steps=300, scaler_type="robust", random_seed=42),
+            NHITS(h=self.horizon, input_size=input_size, max_steps=300, scaler_type="robust", random_seed=42,
+                  hist_exog_list=features if features else None),
+            LSTM(h=self.horizon, input_size=input_size, max_steps=300, scaler_type="robust", random_seed=42,
+                 hist_exog_list=features if features else None),
         ]
 
         freq = VALID_INTERVALS.get(self.interval, {}).get("freq", "D")
