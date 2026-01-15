@@ -8,7 +8,6 @@ import time
 import threading
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median, pstdev
@@ -35,19 +34,8 @@ GROUPS_FILE = Path(__file__).parent / "models" / "groups.json"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Thread-safe counters
+# Thread-safe printing
 _print_lock = threading.Lock()
-_stats_lock = threading.Lock()
-
-
-@dataclass
-class Stats:
-    processed: int = 0
-    retries: int = 0
-    failed: int = 0
-
-
-_stats = Stats()
 
 
 def log(msg: str, color: str = ""):
@@ -126,29 +114,6 @@ def load_json_file(path: Path) -> Optional[dict]:
         if not content:
             return None
         return json.loads(content)
-
-
-def summarize_price_feed(data: dict) -> Dict[str, Union[int, float, dict]]:
-    pf = data.get("data", {})
-    return {
-        "open": pf.get("open"),
-        "high": pf.get("high"),
-        "low": pf.get("low"),
-        "close": pf.get("close"),
-        "last": pf.get("lastprice"),
-        "prev_close": pf.get("previous"),
-        "change": pf.get("change"),
-        "pct_change": pf.get("percentage_change"),
-        "average": pf.get("average"),
-        "value": pf.get("value"),
-        "volume": pf.get("volume"),
-        "foreign_buy": pf.get("fbuy"),
-        "foreign_sell": pf.get("fsell"),
-        "foreign_net": pf.get("fnet"),
-        "total_bid_offer": pf.get("total_bid_offer"),
-        "bid_levels": len(pf.get("bid", [])),
-        "offer_levels": len(pf.get("offer", [])),
-    }
 
 
 def summarize_depth(data: dict) -> Dict[str, dict]:
@@ -453,6 +418,72 @@ def summarize_findata(data: dict) -> dict:
     return summary
 
 
+def summarize_historical_price(data: dict) -> Dict[str, Union[int, float, List, None]]:
+    """Summarize historical daily price data from price-feed API."""
+    raw_data = data.get("data", {})
+
+    # API returns data in data.result array
+    if isinstance(raw_data, dict):
+        history = raw_data.get("result", []) or raw_data.get("summary", []) or []
+    elif isinstance(raw_data, list):
+        history = raw_data
+    else:
+        history = []
+
+    if not history or not isinstance(history, list):
+        return {"count": 0, "latest": None, "history": []}
+
+    # Extract latest day for backward compatibility with forecast.py
+    latest = history[0] if history else {}
+
+    # Parse all close prices and volumes for statistics
+    closes = []
+    volumes = []
+    for item in history:
+        close = parse_numeric_string(item.get("close"))
+        vol = parse_numeric_string(item.get("volume"))
+        if close is not None:
+            closes.append(close)
+        if vol is not None:
+            volumes.append(vol)
+
+    summary: Dict[str, Union[int, float, List, None]] = {
+        # Latest day values (backward compatible with old price_feed format)
+        "open": parse_numeric_string(latest.get("open")),
+        "high": parse_numeric_string(latest.get("high")),
+        "low": parse_numeric_string(latest.get("low")),
+        "close": parse_numeric_string(latest.get("close")),
+        "last": parse_numeric_string(latest.get("close")),
+        "volume": parse_numeric_string(latest.get("volume")),
+        "value": parse_numeric_string(latest.get("value")),
+        "frequency": parse_numeric_string(latest.get("frequency")),
+        "average": parse_numeric_string(latest.get("average")),
+        "date": latest.get("date"),
+        # Foreign flow from latest day (API provides this per day!)
+        "foreign_buy": parse_numeric_string(latest.get("foreign_buy")),
+        "foreign_sell": parse_numeric_string(latest.get("foreign_sell")),
+        "foreign_net": parse_numeric_string(latest.get("net_foreign")),
+        # Daily change from API
+        "change": parse_numeric_string(latest.get("change")),
+        "pct_change": parse_numeric_string(latest.get("change_percentage")),
+        # Historical summary statistics
+        "count": len(history),
+        "price_min": min(closes) if closes else None,
+        "price_max": max(closes) if closes else None,
+        "price_mean": mean(closes) if closes else None,
+        "volume_mean": mean(volumes) if volumes else None,
+        # Full history for enhanced forecasting
+        "history": history,
+    }
+
+    # Calculate multi-day price change if we have enough data
+    if len(closes) >= 2:
+        summary["price_change_total"] = closes[0] - closes[-1]  # Latest vs oldest
+        summary["price_change_total_pct"] = ((closes[0] / closes[-1]) - 1) * 100 if closes[-1] else None
+
+    return summary
+
+
 def build_analysis_summary(base_dir: Path) -> dict:
     """Build comprehensive analysis summary from all source files."""
     price_feed = load_json_file(base_dir / "price-feed.json")
@@ -465,11 +496,8 @@ def build_analysis_summary(base_dir: Path) -> dict:
     symbol = base_dir.parent.name
     session = base_dir.name
 
-    orderbook_source: Optional[str] = None
-    if orderbook:
-        orderbook_source = "orderbook.json"
-    elif price_feed and price_feed.get("data", {}).get("bid") and price_feed.get("data", {}).get("offer"):
-        orderbook_source = "price-feed.json"
+    # Depth data now only comes from orderbook.json (price-feed is historical data)
+    has_orderbook = orderbook and orderbook.get("data", {}).get("bid") and orderbook.get("data", {}).get("offer")
 
     available_files = sorted(p.name for p in base_dir.glob("*.json"))
     sources_analyzed = [
@@ -478,7 +506,7 @@ def build_analysis_summary(base_dir: Path) -> dict:
             ("running-trade.json", running_trade),
             ("today-running-trade.json", today_running_trade),
             ("market-detector.json", market_detector),
-            ("orderbook.json", orderbook if orderbook_source == "orderbook.json" else price_feed if orderbook_source == "price-feed.json" else None),
+            ("orderbook.json", orderbook if has_orderbook else None),
             ("findata.json", findata),
         ] if data is not None
     ]
@@ -488,13 +516,16 @@ def build_analysis_summary(base_dir: Path) -> dict:
             ("running-trade.json", running_trade),
             ("today-running-trade.json", today_running_trade),
             ("market-detector.json", market_detector),
-            ("orderbook.json", orderbook if orderbook_source == "orderbook.json" else price_feed if orderbook_source == "price-feed.json" else None),
+            ("orderbook.json", orderbook if has_orderbook else None),
             ("findata.json", findata),
         ] if data is None
     ]
 
     md_summary = summarize_market_detector(market_detector) if market_detector else None
     fd_summary = summarize_findata(findata) if findata else None
+
+    # Summarize historical price data
+    pf_summary = summarize_historical_price(price_feed) if price_feed else None
 
     return {
         "metadata": {
@@ -504,7 +535,7 @@ def build_analysis_summary(base_dir: Path) -> dict:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "available_files": available_files,
             "sources_analyzed": sources_analyzed,
-            "orderbook_source": orderbook_source,
+            "has_orderbook": has_orderbook,
             "missing_sources": missing_sources,
             "time_horizons": {
                 "market_detector": {
@@ -516,10 +547,14 @@ def build_analysis_summary(base_dir: Path) -> dict:
                     "to": fd_summary.get("to") if fd_summary else None,
                     "date_range": fd_summary.get("date_range") if fd_summary else None,
                 },
+                "price_feed": {
+                    "date": pf_summary.get("date") if pf_summary else None,
+                    "count": pf_summary.get("count") if pf_summary else None,
+                },
             },
         },
-        "price_feed": summarize_price_feed(price_feed) if price_feed else None,
-        "depth": summarize_depth(price_feed if orderbook_source == "price-feed.json" else orderbook) if price_feed or orderbook else None,
+        "price_feed": pf_summary,
+        "depth": summarize_depth(orderbook) if has_orderbook else None,
         "price_series": summarize_price_series(running_trade) if running_trade else None,
         "running_trade": summarize_running_trades(today_running_trade) if today_running_trade else None,
         "broker_chart": summarize_broker_charts(running_trade) if running_trade else None,
@@ -574,7 +609,7 @@ def normalize_auth(token):
     return token if token.startswith("Bearer ") else f"Bearer {token}"
 
 
-def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int, Optional[str]]:
+def fetch_json(url, session, output, max_retries=3) -> Tuple[bool, int, Optional[str]]:
     """Fetch JSON from URL and save to file.
 
     Returns: (success: bool, retries_used: int, failure_reason: Optional[str])
@@ -583,7 +618,7 @@ def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int, Optional
 
     for attempt in range(max_retries + 1):
         try:
-            res = requests.get(url, headers=headers, timeout=30)
+            res = session.get(url, timeout=30)
 
             # Rate limited - retry with backoff
             if res.status_code == 429:
@@ -639,22 +674,41 @@ def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int, Optional
 
 
 def fetch_json_task(args) -> Tuple[bool, int, str, Optional[str]]:
-    """Wrapper for concurrent fetch. Args: (url, headers, output_path)
+    """Wrapper for concurrent fetch. Args: (url, session, output_path)
 
     Returns: (success, retries, endpoint_name, failure_reason)
     """
-    url, headers, output = args
+    url, session, output = args
     # Extract endpoint name from filename (e.g., "findata.json" -> "Findata")
     endpoint_name = output.stem.replace("-", " ").title()
-    success, retries, reason = fetch_json(url, headers, output)
+    success, retries, reason = fetch_json(url, session, output)
     return success, retries, endpoint_name, reason
 
 
 def get_next_dir(path: Path) -> Path:
-    numbers = [int(p.name) for p in path.iterdir() if p.is_dir() and p.name.isdigit()]
-    next_num = (max(numbers) + 1) if numbers else 1
+    """Get next session directory, using cached counter for efficiency."""
+    counter_file = path / ".last_session"
+
+    # Try to read from counter file first (fast path)
+    if counter_file.exists():
+        try:
+            next_num = int(counter_file.read_text().strip()) + 1
+        except (ValueError, OSError):
+            # Fall back to directory scan
+            next_num = None
+    else:
+        next_num = None
+
+    # Fall back to directory scan if counter file doesn't exist or is invalid
+    if next_num is None:
+        numbers = [int(p.name) for p in path.iterdir() if p.is_dir() and p.name.isdigit()]
+        next_num = (max(numbers) + 1) if numbers else 1
+
+    # Create directory and update counter
     new_dir = path / str(next_num)
     new_dir.mkdir(parents=True, exist_ok=True)
+    counter_file.write_text(str(next_num))
+
     return new_dir
 
 
@@ -681,7 +735,7 @@ def get_symbols_from_input(input_val, groups):
     return [input_val.upper()]
 
 
-def process_symbol(symbol: str, index: int, total: int, sb_auth: str, headers: dict) -> Tuple[str, bool, int, int]:
+def process_symbol(symbol: str, index: int, total: int, session: requests.Session) -> Tuple[str, bool, int, int]:
     """Process a single symbol - create directory, fetch data, generate analysis, cleanup.
 
     Returns: (symbol, success, retries, failures)
@@ -701,7 +755,7 @@ def process_symbol(symbol: str, index: int, total: int, sb_auth: str, headers: d
         "findata.json",
     ]
 
-    if not sb_auth:
+    if not session.headers.get("Authorization"):
         for filename in json_files:
             (new_dir / filename).touch()
         log(f"{Fore.RED}{symbol} Failed{Style.RESET_ALL} ({index}/{total}) - No auth")
@@ -713,39 +767,45 @@ def process_symbol(symbol: str, index: int, total: int, sb_auth: str, headers: d
     from_str = from_date.strftime("%Y-%m-%d")
     to_str = today.strftime("%Y-%m-%d")
 
+    # Historical price data - API max is 50 items per page
+    price_history_limit = 50
+    price_from_date = today - timedelta(days=365)  # Request 1 year range
+    price_from_str = price_from_date.strftime("%Y-%m-%d")
+
     fetch_tasks = [
         (
             f"https://exodus.stockbit.com/marketdetectors/{symbol}"
             f"?transaction_type=TRANSACTION_TYPE_NET&from={from_str}&to={to_str}"
             f"&market_board=MARKET_BOARD_REGULER&investor_type=INVESTOR_TYPE_FOREIGN&limit=25",
-            headers,
+            session,
             new_dir / "market-detector.json",
         ),
         (
-            f"https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/{symbol}",
-            headers,
+            f"https://exodus.stockbit.com/company-price-feed/historical/summary/{symbol}"
+            f"?period=HS_PERIOD_DAILY&start_date={price_from_str}&end_date={to_str}&limit={price_history_limit}&page=1",
+            session,
             new_dir / "price-feed.json",
         ),
         (
             f"https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/{symbol}",
-            headers,
+            session,
             new_dir / "orderbook.json",
         ),
         (
             f"https://exodus.stockbit.com/order-trade/running-trade/chart/{symbol}?period=RT_PERIOD_LAST_1_DAY",
-            headers,
+            session,
             new_dir / "running-trade.json",
         ),
         (
             f"https://exodus.stockbit.com/order-trade/running-trade"
             f"?sort=DESC&limit=100&order_by=RUNNING_TRADE_ORDER_BY_TIME&symbols%5B%5D={symbol}",
-            headers,
+            session,
             new_dir / "today-running-trade.json",
         ),
         (
             f"https://exodus.stockbit.com/findata-view/foreign-domestic/v1/chart-data/{symbol}"
             f"?market_type=MARKET_TYPE_REGULAR&period=PERIOD_RANGE_1M",
-            headers,
+            session,
             new_dir / "findata.json",
         ),
     ]
@@ -798,8 +858,6 @@ Examples:
     parser.add_argument("-e", "--exclude", help="Exclude group(s), comma-separated")
     parser.add_argument("-j", "--jobs", type=int, default=MAX_CONCURRENT_SYMBOLS,
                         help=f"Concurrent symbols (default: {MAX_CONCURRENT_SYMBOLS})")
-    parser.add_argument("-d", "--delay", type=int, default=1,
-                        help="Seconds between batches (default: 1)")
     parser.add_argument("--list-sectors", action="store_true", help="List sectors")
 
     args = parser.parse_args()
@@ -841,14 +899,19 @@ Examples:
     else:
         parser.error("Please provide: a symbol, -g <groups>, or -e <exclude_groups>")
 
+    # Deduplicate symbols while preserving order
+    symbols = list(dict.fromkeys(symbols))
+
+    # Create session with connection pooling for better performance
     sb_auth = normalize_auth(os.getenv("SB_AUTH"))
-    headers = {
+    session = requests.Session()
+    session.headers.update({
         "Accept": "application/json",
         "Authorization": sb_auth or "",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
         "Origin": "https://stockbit.com",
         "Referer": "https://stockbit.com/",
-    }
+    })
 
     total = len(symbols)
     total_retries = 0
@@ -860,7 +923,7 @@ Examples:
     # Process symbols concurrently in batches
     with ThreadPoolExecutor(max_workers=args.jobs) as executor:
         # Create indexed tasks
-        tasks = [(sym, i + 1, total, sb_auth, headers) for i, sym in enumerate(symbols)]
+        tasks = [(sym, i + 1, total, session) for i, sym in enumerate(symbols)]
 
         # Submit all
         futures = {executor.submit(process_symbol, *task): task[0] for task in tasks}

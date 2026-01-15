@@ -159,27 +159,42 @@ class MarketAlphaEngine:
             buy_conc = top3_pct / 2
             sell_conc = top3_pct / 2
 
-        # Foreign flow from price_feed or findata
-        foreign_net_val = self.parse_number(pf.get("foreign_net", 0))
-        findata = analysis.get("findata", {})
-        if findata:
-            summary = findata.get("summary", {})
-            if summary:
-                net_foreign = summary.get("net_foreign", {})
-                if net_foreign:
-                    foreign_net_val = self.parse_number(net_foreign.get("raw", 0))
-
-        # Calculate foreign ratio
+        # Foreign flow - prefer price_feed (historical API has per-day data), fallback to findata
         foreign_buy = self.parse_number(pf.get("foreign_buy", 0))
         foreign_sell = self.parse_number(pf.get("foreign_sell", 0))
+        foreign_net_val = self.parse_number(pf.get("foreign_net", 0))
+
+        # Fallback to findata if price_feed doesn't have foreign data
+        if foreign_buy == 0 and foreign_sell == 0:
+            findata = analysis.get("findata", {})
+            if findata:
+                summary = findata.get("summary", {})
+                if summary:
+                    net_foreign = summary.get("net_foreign", {})
+                    if net_foreign:
+                        foreign_net_val = self.parse_number(net_foreign.get("raw", 0))
+                    fb = summary.get("foreign_buy", {})
+                    if fb:
+                        foreign_buy = self.parse_number(fb.get("raw", 0))
+                    fs = summary.get("foreign_sell", {})
+                    if fs:
+                        foreign_sell = self.parse_number(fs.get("raw", 0))
+
+        # Calculate foreign ratio
         total_foreign = foreign_buy + foreign_sell
         foreign_ratio = foreign_net_val / (total_foreign + 1e-5) if total_foreign > 0 else 0.0
 
         # Volatility
         volatility = (high - low) / (close + 1e-5) if close > 0 else 0.0
 
-        # Price momentum
+        # Price momentum - use API-provided pct_change, fallback to calculation
         pct_change = self.parse_number(pf.get("pct_change", 0))
+        if pct_change == 0:
+            history = pf.get("history", [])
+            if history and len(history) >= 2:
+                prev_close = self.parse_number(history[1].get("close", 0))
+                if prev_close > 0:
+                    pct_change = ((close - prev_close) / prev_close) * 100
 
         return {
             "ds": ds,
