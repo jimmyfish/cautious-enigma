@@ -574,10 +574,10 @@ def normalize_auth(token):
     return token if token.startswith("Bearer ") else f"Bearer {token}"
 
 
-def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int]:
+def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int, Optional[str]]:
     """Fetch JSON from URL and save to file.
 
-    Returns: (success: bool, retries_used: int)
+    Returns: (success: bool, retries_used: int, failure_reason: Optional[str])
     """
     retries_used = 0
 
@@ -595,7 +595,7 @@ def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int]:
                     continue
                 else:
                     output.touch()
-                    return False, retries_used
+                    return False, retries_used, "429 Rate Limited"
 
             # Server error - retry with backoff
             if res.status_code >= 500:
@@ -607,11 +607,11 @@ def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int]:
                     continue
                 else:
                     output.touch()
-                    return False, retries_used
+                    return False, retries_used, f"{res.status_code} Server Error"
 
             res.raise_for_status()
             output.write_text(json.dumps(res.json(), indent=4, ensure_ascii=False))
-            return True, retries_used
+            return True, retries_used, None
 
         except requests.exceptions.Timeout:
             if attempt < max_retries:
@@ -621,19 +621,33 @@ def fetch_json(url, headers, output, max_retries=3) -> Tuple[bool, int]:
                 time.sleep(wait)
                 continue
             output.touch()
-            return False, retries_used
+            return False, retries_used, "Timeout"
 
-        except Exception:
+        except requests.exceptions.HTTPError as e:
             output.touch()
-            return False, retries_used
+            return False, retries_used, f"{e.response.status_code} HTTP Error"
 
-    return False, retries_used
+        except requests.exceptions.ConnectionError:
+            output.touch()
+            return False, retries_used, "Connection Error"
+
+        except Exception as e:
+            output.touch()
+            return False, retries_used, str(e)[:50]
+
+    return False, retries_used, "Max Retries"
 
 
-def fetch_json_task(args) -> Tuple[bool, int]:
-    """Wrapper for concurrent fetch. Args: (url, headers, output_path)"""
+def fetch_json_task(args) -> Tuple[bool, int, str, Optional[str]]:
+    """Wrapper for concurrent fetch. Args: (url, headers, output_path)
+
+    Returns: (success, retries, endpoint_name, failure_reason)
+    """
     url, headers, output = args
-    return fetch_json(url, headers, output)
+    # Extract endpoint name from filename (e.g., "findata.json" -> "Findata")
+    endpoint_name = output.stem.replace("-", " ").title()
+    success, retries, reason = fetch_json(url, headers, output)
+    return success, retries, endpoint_name, reason
 
 
 def get_next_dir(path: Path) -> Path:
@@ -739,14 +753,16 @@ def process_symbol(symbol: str, index: int, total: int, sb_auth: str, headers: d
     # Concurrent fetch
     total_retries = 0
     total_failures = 0
+    failed_endpoints = []
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(fetch_json_task, task) for task in fetch_tasks]
         for future in as_completed(futures):
-            success, retries = future.result()
+            success, retries, endpoint_name, reason = future.result()
             total_retries += retries
             if not success:
                 total_failures += 1
+                failed_endpoints.append(f"{endpoint_name}: {reason}")
 
     # Generate analysis
     analysis_path = generate_analysis(new_dir)
@@ -757,7 +773,8 @@ def process_symbol(symbol: str, index: int, total: int, sb_auth: str, headers: d
     if total_failures == 0:
         log(f"{Fore.GREEN}{symbol} Initiated{Style.RESET_ALL} ({index}/{total})")
     else:
-        log(f"{Fore.YELLOW}{symbol} Initiated{Style.RESET_ALL} ({index}/{total}) [{total_failures} failed]")
+        failures_str = " | ".join(failed_endpoints)
+        log(f"{Fore.YELLOW}{symbol} Initiated{Style.RESET_ALL} ({index}/{total}) [{total_failures} failed: {failures_str}]")
 
     return symbol, total_failures == 0, total_retries, total_failures
 
@@ -848,19 +865,12 @@ Examples:
         # Submit all
         futures = {executor.submit(process_symbol, *task): task[0] for task in tasks}
 
-        batch_count = 0
         for future in as_completed(futures):
             symbol, success, retries, failures = future.result()
             processed += 1
             total_retries += retries
             if not success:
                 total_failed += 1
-
-            # Rest between batches
-            batch_count += 1
-            if batch_count % args.jobs == 0 and processed < total and args.delay > 0:
-                log(f"\n{Fore.BLUE}Rest {args.delay}s ...{Style.RESET_ALL}\n")
-                time.sleep(args.delay)
 
     # Summary
     print(f"\n{Fore.GREEN}Done{Style.RESET_ALL}")
