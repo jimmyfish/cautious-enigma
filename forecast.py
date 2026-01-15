@@ -59,7 +59,7 @@ def find_group_for_symbol(symbol: str, groups: Dict[str, List[str]]) -> Optional
 
 class MarketAlphaEngine:
     """
-    Extract alpha-generating features from market data snapshots.
+    Extract alpha-generating features from analysis-data-*.json files.
     Based on institutional trading patterns and order flow analysis.
     """
 
@@ -84,145 +84,21 @@ class MarketAlphaEngine:
             return float(value.replace(",", "").replace(" ", "") or 0)
         return 0.0
 
-    def calculate_orderbook_imbalance(self, data: dict) -> float:
-        """
-        Calculate Orderbook Imbalance (OBI) - The "Pressure"
-        OBI = (bid_volume - ask_volume) / (bid_volume + ask_volume)
-        Range: -1 (all sellers) to +1 (all buyers)
-        """
-        if not data or "data" not in data:
-            return 0.0
-
-        d = data["data"]
-        bids = d.get("bid", [])
-        asks = d.get("offer", [])
-
-        bid_volume = sum(self.parse_number(b.get("volume", 0)) for b in bids)
-        ask_volume = sum(self.parse_number(a.get("volume", 0)) for a in asks)
-
-        total = bid_volume + ask_volume
-        if total == 0:
-            return 0.0
-
-        return (bid_volume - ask_volume) / total
-
-    def calculate_bandar_concentration(self, data: dict) -> Tuple[float, float]:
-        """
-        Calculate Bandar (Market Maker) Concentration - The "Intent"
-        Top 3 brokers' share of total volume indicates institutional activity.
-        Returns: (buy_concentration, sell_concentration)
-        """
-        if not data or "data" not in data:
-            return 0.0, 0.0
-
-        broker_summary = data["data"].get("broker_summary", {})
-
-        # Buy concentration
-        brokers_buy = broker_summary.get("brokers_buy", [])
-        if brokers_buy:
-            top3_buy = sum(
-                abs(self.parse_number(b.get("blot", 0))) for b in brokers_buy[:3]
-            )
-            total_buy = sum(
-                abs(self.parse_number(b.get("blot", 0))) for b in brokers_buy
-            )
-            buy_concentration = top3_buy / (total_buy + 1e-5)
-        else:
-            buy_concentration = 0.0
-
-        # Sell concentration
-        brokers_sell = broker_summary.get("brokers_sell", [])
-        if brokers_sell:
-            top3_sell = sum(
-                abs(self.parse_number(b.get("slot", 0))) for b in brokers_sell[:3]
-            )
-            total_sell = sum(
-                abs(self.parse_number(b.get("slot", 0))) for b in brokers_sell
-            )
-            sell_concentration = top3_sell / (total_sell + 1e-5)
-        else:
-            sell_concentration = 0.0
-
-        return buy_concentration, sell_concentration
-
-    def calculate_foreign_flow(self, data: dict) -> Tuple[float, float, float]:
-        """
-        Calculate Foreign Flow Dominance.
-        Returns: (foreign_net_value, foreign_net_volume, foreign_ratio)
-        """
-        if not data or "data" not in data:
-            return 0.0, 0.0, 0.0
-
-        d = data["data"]
-
-        # From findata.json structure
-        summary = d.get("summary", {})
-        if summary:
-            fb = summary.get("foreign_buy", {}).get("value", {}).get("raw", 0)
-            fs = summary.get("foreign_sell", {}).get("value", {}).get("raw", 0)
-            foreign_net_value = self.parse_number(fb) - self.parse_number(fs)
-
-            vol_data = summary.get("volume", {})
-            fvb = vol_data.get("foreign_buy", {}).get("value", {}).get("raw", 0)
-            fvs = vol_data.get("foreign_sell", {}).get("value", {}).get("raw", 0)
-            foreign_net_volume = self.parse_number(fvb) - self.parse_number(fvs)
-
-            total_value = self.parse_number(fb) + self.parse_number(fs)
-            foreign_ratio = foreign_net_value / (total_value + 1e-5)
-
-            return foreign_net_value, foreign_net_volume, foreign_ratio
-
-        # Fallback to price-feed structure
-        fnet = self.parse_number(d.get("fnet", 0))
-        return fnet, 0.0, 0.0
-
-    def calculate_bandar_accdist(self, data: dict) -> Tuple[float, float]:
-        """
-        Calculate accumulation/distribution signal from bandar detector.
-        Returns: (accdist_signal, net_percent)
-        """
-        if not data or "data" not in data:
-            return 0.0, 0.0
-
-        bd = data["data"].get("bandar_detector", {})
-        if not bd:
-            return 0.0, 0.0
-
-        # Accumulation/Distribution signal
-        avg_data = bd.get("avg", {})
-        accdist_map = {
-            "Big Acc": 2.0,
-            "Normal Acc": 1.0,
-            "Neutral": 0.0,
-            "Normal Dist": -1.0,
-            "Big Dist": -2.0,
-        }
-        accdist = accdist_map.get(avg_data.get("accdist", "Neutral"), 0.0)
-        net_percent = self.parse_number(avg_data.get("percent", 0))
-
-        return accdist, net_percent
-
     def extract_session_features(self, symbol: str, session: str) -> Optional[Dict]:
-        """Extract all alpha features from a single session."""
+        """Extract all alpha features from analyzed.json."""
         session_path = self.base_path / symbol / session
 
-        # Load all data files
-        price_feed = self.load_json(session_path / "price-feed.json")
-        orderbook = self.load_json(session_path / "orderbook.json")
-        market_detector = self.load_json(session_path / "market-detector.json")
-        findata = self.load_json(session_path / "findata.json")
-
-        # Use price-feed as orderbook fallback (same structure)
-        if not orderbook:
-            orderbook = price_feed
-
-        if not price_feed or "data" not in price_feed:
+        # Load analyzed.json
+        analysis = self.load_json(session_path / "analyzed.json")
+        if not analysis:
             return None
 
-        pf = price_feed["data"]
+        # Extract price data from price_feed section
+        pf = analysis.get("price_feed", {})
+        if not pf:
+            return None
 
-        # Get price data
-        close = self.parse_number(pf.get("close", 0) or pf.get("lastprice", 0))
+        close = self.parse_number(pf.get("close", 0) or pf.get("last", 0))
         if close == 0:
             return None
 
@@ -231,42 +107,79 @@ class MarketAlphaEngine:
         open_price = self.parse_number(pf.get("open", 0))
         volume = self.parse_number(pf.get("volume", 0))
         value = self.parse_number(pf.get("value", 0))
-        frequency = self.parse_number(pf.get("frequency", 0))
 
-        # Extract date
+        # Extract date from metadata
         ds = None
-        for f in session_path.glob("analysis-data-*.json"):
+        time_horizons = analysis.get("metadata", {}).get("time_horizons", {})
+        md_to = time_horizons.get("market_detector", {}).get("to")
+        if md_to:
             try:
-                date_str = f.stem.replace("analysis-data-", "").split("_")[0]
-                ds = datetime.strptime(date_str, "%Y-%m-%d")
-                break
+                ds = datetime.strptime(md_to, "%Y-%m-%d")
             except:
                 pass
 
-        if not ds and market_detector and "data" in market_detector:
-            date_str = market_detector["data"].get("from")
-            if date_str:
-                try:
-                    ds = datetime.strptime(date_str, "%Y-%m-%d")
-                except:
-                    pass
-
         if not ds:
-            ds = datetime.now() - timedelta(days=int(session))
+            ds = datetime.now() - timedelta(days=int(session) if session.isdigit() else 0)
 
-        # Calculate alpha features
-        obi = self.calculate_orderbook_imbalance(orderbook)
-        buy_conc, sell_conc = self.calculate_bandar_concentration(market_detector)
-        foreign_net_val, foreign_net_vol, foreign_ratio = self.calculate_foreign_flow(
-            findata or price_feed
-        )
-        accdist, net_percent = self.calculate_bandar_accdist(market_detector)
+        # Calculate OBI from depth section (pre-computed totals)
+        depth = analysis.get("depth", {})
+        bid_vol = self.parse_number(depth.get("bid", {}).get("total_volume", 0))
+        ask_vol = self.parse_number(depth.get("offer", {}).get("total_volume", 0))
+        total_vol = bid_vol + ask_vol
+        obi = (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0.0
+
+        # Extract bandar/market detector data
+        md = analysis.get("market_detector", {})
+        bandar = md.get("bandar", {}) if md else {}
+
+        # AccDist signal from top1
+        top1 = bandar.get("top1", {}) if bandar else {}
+        accdist_map = {
+            "Big Acc": 2.0,
+            "Normal Acc": 1.0,
+            "Neutral": 0.0,
+            "Normal Dist": -1.0,
+            "Big Dist": -2.0,
+        }
+        accdist = accdist_map.get(top1.get("accdist", "Neutral"), 0.0)
+        net_percent = self.parse_number(top1.get("percent", 0))
+
+        # Concentration from top3 percent (already computed as percentage of total)
+        top3 = bandar.get("top3", {}) if bandar else {}
+        # top3.percent is negative for distribution, positive for accumulation
+        # Convert to buy/sell concentration estimate
+        top3_pct = abs(self.parse_number(top3.get("percent", 0))) / 100.0
+        if top3.get("accdist", "").endswith("Acc"):
+            buy_conc = min(top3_pct, 1.0)
+            sell_conc = 0.0
+        elif top3.get("accdist", "").endswith("Dist"):
+            buy_conc = 0.0
+            sell_conc = min(top3_pct, 1.0)
+        else:
+            buy_conc = top3_pct / 2
+            sell_conc = top3_pct / 2
+
+        # Foreign flow from price_feed or findata
+        foreign_net_val = self.parse_number(pf.get("foreign_net", 0))
+        findata = analysis.get("findata", {})
+        if findata:
+            summary = findata.get("summary", {})
+            if summary:
+                net_foreign = summary.get("net_foreign", {})
+                if net_foreign:
+                    foreign_net_val = self.parse_number(net_foreign.get("raw", 0))
+
+        # Calculate foreign ratio
+        foreign_buy = self.parse_number(pf.get("foreign_buy", 0))
+        foreign_sell = self.parse_number(pf.get("foreign_sell", 0))
+        total_foreign = foreign_buy + foreign_sell
+        foreign_ratio = foreign_net_val / (total_foreign + 1e-5) if total_foreign > 0 else 0.0
 
         # Volatility
         volatility = (high - low) / (close + 1e-5) if close > 0 else 0.0
 
         # Price momentum
-        pct_change = self.parse_number(pf.get("percentage_change", 0))
+        pct_change = self.parse_number(pf.get("pct_change", 0))
 
         return {
             "ds": ds,
@@ -281,7 +194,7 @@ class MarketAlphaEngine:
             "close": close,
             "volume": volume,
             "value": value,
-            "frequency": frequency,
+            "frequency": 0,  # Not available in analysis JSON
             # Alpha Features
             "obi": obi,  # Orderbook Imbalance
             "buy_concentration": buy_conc,  # Top 3 buyer concentration

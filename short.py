@@ -105,32 +105,16 @@ class TickToOHLCV:
         return float(str(val).replace(",", "") or 0)
 
     def get_session_date(self, session_path: Path) -> datetime:
-        """Extract date from session files."""
-        for f in session_path.glob("analysis-data-*.json"):
-            try:
-                date_str = f.stem.replace("analysis-data-", "").split("_")[0]
-                return datetime.strptime(date_str, "%Y-%m-%d")
-            except:
-                pass
-
-        md = self.load_json(session_path / "market-detector.json")
-        if md and "data" in md:
-            date_str = md["data"].get("from")
-            if date_str:
+        """Extract date from analyzed.json file."""
+        analysis = self.load_json(session_path / "analyzed.json")
+        if analysis:
+            time_horizons = analysis.get("metadata", {}).get("time_horizons", {})
+            md_to = time_horizons.get("market_detector", {}).get("to")
+            if md_to:
                 try:
-                    return datetime.strptime(date_str, "%Y-%m-%d")
+                    return datetime.strptime(md_to, "%Y-%m-%d")
                 except:
                     pass
-
-        fd = self.load_json(session_path / "findata.json")
-        if fd and "data" in fd:
-            date_str = fd["data"].get("from")
-            if date_str:
-                try:
-                    return datetime.strptime(date_str, "%Y-%m-%d")
-                except:
-                    pass
-
         return datetime.now()
 
     def parse_trades(self, trades: List[dict], base_date: datetime) -> pd.DataFrame:
@@ -213,18 +197,11 @@ class TickToOHLCV:
     def load_session(
         self, symbol: str, session: str, interval: int = 5
     ) -> pd.DataFrame:
-        """Load and process a single session."""
+        """Load and process a single session from today-running-trade.json."""
         session_path = self.base_path / symbol / session
         base_date = self.get_session_date(session_path)
 
-        rt = self.load_json(session_path / "running-trade.json")
-        if rt and "data" in rt:
-            trades = rt["data"].get("running_trade", [])
-            if trades:
-                tick_df = self.parse_trades(trades, base_date)
-                if not tick_df.empty:
-                    return self.aggregate_bars(tick_df, interval)
-
+        # Load tick data from today-running-trade.json
         trt = self.load_json(session_path / "today-running-trade.json")
         if trt and "data" in trt:
             trades = trt["data"].get("running_trade", [])
