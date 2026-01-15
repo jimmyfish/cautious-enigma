@@ -7,3 +7,4 @@ lightning_logs/
 *.csv
 *.png
 subsectors.md
+**/__pycache__
