@@ -12,8 +12,11 @@ A command-line toolkit for analyzing Indonesian Stock Exchange (IDX) stocks. Pro
 - **Bandar Detection** - Identify accumulation/distribution signals from market maker activity
 - **Price Forecasting** - Neural network-based price predictions using TFT, NBEATS, NHITS models
 - **Intraday Forecasting** - Session-level forecasts for next trading day using tick data
-- **Group Training** - Train models on stock groups (banking, mining, etc.) for better pattern recognition
+- **Yahoo Finance Forecasting** - Forecast global stocks using yfinance with technical indicators
+- **Cross-Validation** - Evaluate model accuracy with time-series CV (MAE, RMSE, MAPE, direction accuracy)
+- **Group Training** - Train models on 18+ IDX sectors (banking, energy, technology, etc.)
 - **Model Persistence** - Save and resume training with checkpoint support for incremental learning
+- **Telegram Notifications** - Optional bot integration for automated alerts
 
 ## Setup
 
@@ -43,6 +46,10 @@ Create a `.env` file in the project root:
 
 ```env
 SB_AUTH=Bearer YOUR_STOCKBIT_TOKEN_HERE
+
+# Optional: Telegram notifications
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
 ```
 
 To get your Stockbit token:
@@ -147,17 +154,67 @@ python short.py ICBP --session1 --no-plot
 
 Output: `short_ICBP_{timestamp}.csv` with intraday predictions
 
+### Yahoo Finance Forecasting
+
+Forecast any global stock using Yahoo Finance data:
+
+```bash
+# Basic forecast
+python yf.py AAPL
+
+# IDX stocks via Yahoo Finance
+python yf.py BBRI.JK --horizon 10
+
+# Multiple symbols (comma-separated)
+python yf.py AAPL,GOOGL,TSLA
+
+# Intraday data
+python yf.py AAPL --interval 1h --period 5d --horizon 24
+
+# Disable auto-plot
+python yf.py AAPL --no-plot
+```
+
+Output: `yf_{SYMBOL}_{timestamp}.csv` with predictions and charts in `plot/`
+
+### Cross-Validation
+
+Evaluate model accuracy using time-series cross-validation:
+
+```bash
+# CV on local tick data
+python cross.py ICBP --source tick
+
+# CV on Yahoo Finance data
+python cross.py AAPL --source yfinance --period 1y
+
+# Custom CV parameters
+python cross.py ICBP --n-windows 5 --horizon 3 --refit
+```
+
+Output: `cross_{SYMBOL}_{timestamp}.csv` with MAE, RMSE, MAPE, direction accuracy metrics
+
 ### Configure Stock Groups
 
-Edit `models/groups.json` to define your stock groups:
+Edit `models/groups.json` to define your stock groups. The file includes 18+ IDX sectors:
 
 ```json
 {
-  "banking": ["BBCA", "BBRI", "BMRI", "BBNI"],
-  "mining": ["ANTM", "INCO", "MDKA", "PTBA"],
-  "consumer": ["ICBP", "INDF", "UNVR", "MYOR"]
+  "banking": ["BBCA", "BBRI", "BMRI", "BBNI", "BRIS", ...],
+  "energy": ["ADRO", "PGAS", "PTBA", "ITMG", "MEDC", ...],
+  "material": ["ANTM", "BRMS", "SMGR", "BRPT", "INTP", ...],
+  "technology": ["MTDL", "EMTK", "BUKA", "DCII", ...],
+  "property": ["CTRA", "BSDE", "PWON", "SMRA", ...],
+  "consumer_non_cyclical": ["GGRM", "HMSP", "UNVR", "INDF", "ICBP", ...],
+  "consumer_cyclical": ["AUTO", "MAPI", "ACES", "ERAA", ...],
+  "health": ["KLBF", "SIDO", "KAEF", "MIKA", ...],
+  "telco": ["TLKM", "EXCL", "ISAT", "TOWR", ...],
+  "industrial": ["UNTR", "HEXA", "IMPC", "TOTO", ...],
+  ...
 }
 ```
+
+Available sectors: `banking`, `energy`, `material`, `technology`, `property`, `consumer_non_cyclical`, `consumer_cyclical`, `health`, `telco`, `industrial`, `utility`, `infrastructure`, `construction`, `transportation`, `logistic`, `investment`, `lending`, `insurance`, `holding`
 
 ### Run Bulk Analysis (Full Workflow)
 
@@ -178,10 +235,12 @@ Output: `sources/BULK_BSJP/analysis-bulk-{timestamp}.md`
 ```
 helpme/
 ├── screener.py           # Fetch screener template results
-├── initiate.py           # Initialize market data for a symbol
+├── initiate.py           # Initialize market data for a symbol/group
 ├── analyze_bsjp.py       # Bulk analysis orchestrator
 ├── forecast.py           # Daily price forecasting (NeuralForecast)
 ├── short.py              # Intraday session forecasting
+├── yf.py                 # Yahoo Finance data forecasting
+├── cross.py              # Cross-validation for model evaluation
 ├── scripts/
 │   └── analyze_market.py # Analytics pipeline
 ├── sources/              # Data storage
@@ -189,7 +248,7 @@ helpme/
 │   │   └── {SESSION}/    # Session directories (1, 2, 3...)
 │   └── BULK_BSJP/        # Bulk analysis reports
 ├── models/               # Saved models and config
-│   ├── groups.json       # Stock group definitions
+│   ├── groups.json       # Stock group definitions (18+ IDX sectors)
 │   ├── forecast_{SYMBOL}/    # Daily forecast models
 │   ├── short_{SYMBOL}_{interval}min/  # Intraday models
 │   └── group_{name}/     # Group-trained models

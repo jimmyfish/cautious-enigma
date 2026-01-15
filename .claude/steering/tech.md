@@ -19,8 +19,8 @@ This is a command-line Python application with script-based workflows. It follow
 - **python-dotenv** - Environment variable management for API tokens
 - **pandas** - Data manipulation and time series handling
 - **NumPy** - Numerical operations
-- **yfinance** - Yahoo Finance data (secondary data source)
-- **ccxt** - Cryptocurrency exchange library (available for potential cross-market analysis)
+- **yfinance** - Yahoo Finance data for global stock forecasting
+- **colorama** - Colored terminal output for progress tracking
 
 ### Forecasting Stack
 
@@ -113,6 +113,17 @@ python short.py ICBP --session1            # Morning session forecast
 python short.py ICBP --session2            # Afternoon session forecast
 python short.py BBCA --group banking       # Group training
 
+# Yahoo Finance forecasting (global stocks)
+python yf.py AAPL                          # Apple daily forecast
+python yf.py BBRI.JK --horizon 10          # IDX stock via Yahoo Finance
+python yf.py AAPL,GOOGL,TSLA               # Multiple symbols (comma-separated)
+python yf.py AAPL --interval 1h --period 5d  # Hourly data
+
+# Cross-validation (model evaluation)
+python cross.py ICBP --source tick         # CV on tick data
+python cross.py AAPL --source yfinance     # CV on Yahoo Finance data
+python cross.py ICBP --n-windows 5         # 5-fold CV
+
 # List available options
 python forecast.py --list                  # List symbols
 python forecast.py --list-groups           # List stock groups
@@ -124,6 +135,8 @@ python initiate.py --list-sectors          # List available groups
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `SB_AUTH` | Stockbit API Bearer token | Yes |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token for notifications | No |
+| `TELEGRAM_CHAT_ID` | Telegram chat ID for notifications | No |
 
 ## Data Storage
 

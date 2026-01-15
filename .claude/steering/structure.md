@@ -7,9 +7,16 @@ helpme/
 ├── screener.py           # Fetch screener template results
 ├── initiate.py           # Initialize market data for a symbol
 ├── analyze_bsjp.py       # Bulk analysis orchestrator
+├── forecast.py           # Daily price forecasting (NeuralForecast)
+├── short.py              # Intraday session forecasting
+├── yf.py                 # Yahoo Finance data forecasting
+├── cross.py              # Cross-validation for model evaluation
 ├── scripts/
 │   └── analyze_market.py # Analytics pipeline
 ├── sources/              # Data storage directory
+├── models/               # Saved models and config
+│   └── groups.json       # Stock group definitions (18+ sectors)
+├── plot/                 # Generated charts
 ├── requirements.txt      # Python dependencies
 ├── .env                  # Environment variables (gitignored)
 └── .claude/
@@ -21,8 +28,12 @@ helpme/
 | Script | Purpose | Usage |
 |--------|---------|-------|
 | `screener.py` | Fetch stock screener results | `python screener.py [TEMPLATE_ID]` |
-| `initiate.py` | Collect market data for a symbol | `python initiate.py {SYMBOL}` |
+| `initiate.py` | Collect market data for a symbol/group | `python initiate.py {SYMBOL}` or `-g {group}` |
 | `analyze_bsjp.py` | Full bulk analysis workflow | `python analyze_bsjp.py` |
+| `forecast.py` | Daily price forecasting | `python forecast.py {SYMBOL} [--horizon N]` |
+| `short.py` | Intraday session forecasting | `python short.py {SYMBOL} --session1/--session2` |
+| `yf.py` | Yahoo Finance forecasting | `python yf.py {SYMBOL} [--interval 1h]` |
+| `cross.py` | Model cross-validation | `python cross.py {SYMBOL} --source tick/yfinance` |
 | `scripts/analyze_market.py` | Generate analytics JSON | `python scripts/analyze_market.py {SYMBOL} {SESSION}` |
 
 ## Data Directory Structure

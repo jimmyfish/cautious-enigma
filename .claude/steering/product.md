@@ -14,8 +14,11 @@
 - **Bandar Detection**: Identify accumulation/distribution signals from market maker (bandar) activity patterns
 - **Price Forecasting**: Neural network-based daily price predictions using TFT, NBEATS, NHITS ensemble with probabilistic confidence intervals
 - **Intraday Forecasting**: Session-level forecasts for next trading day using tick-level data aggregated into OHLCV bars
-- **Group Training**: Train models on related stocks (banking, mining, consumer sectors) to learn common market patterns and improve generalization
+- **Yahoo Finance Forecasting**: Forecast any global stock using Yahoo Finance data with technical indicators (RSI, MACD, Bollinger Bands)
+- **Cross-Validation**: Time-series cross-validation to evaluate model accuracy before deployment (MAE, RMSE, MAPE, direction accuracy)
+- **Group Training**: Train models on related stocks (18+ IDX sectors including banking, energy, technology, property, etc.) to learn common market patterns
 - **Incremental Learning**: Model persistence with warm-start training - saves checkpoints and fine-tunes on new data instead of retraining from scratch
+- **Telegram Notifications**: Optional Telegram bot integration for automated alerts
 
 ## Target Use Case
 
