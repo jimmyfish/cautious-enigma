@@ -1,6 +1,7 @@
 sources/
 .env
 **/*.json
+!models/groups.json
 !n8n-wf.json
 lightning_logs/
 *.csv

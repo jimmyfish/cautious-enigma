@@ -16,6 +16,32 @@ load_dotenv()
 
 GROUPS_FILE = Path(__file__).parent / "models" / "groups.json"
 
+# Telegram config (set in .env)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+def send_telegram(message: str) -> bool:
+    """Send a message to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("  ! Telegram not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        print("  ✓ Telegram notification sent")
+        return True
+    except Exception as e:
+        print(f"  ✗ Telegram error: {e}")
+        return False
+
 
 def normalize_auth(token):
     if not token:
@@ -67,7 +93,7 @@ def get_symbols_from_input(input_val, groups):
 
 def process_symbol(symbol, sb_auth, headers):
     """Process a single symbol - create directory and fetch data"""
-    base_dir = Path("sources") / symbol
+    base_dir = Path(__file__).parent / "sources" / symbol
     base_dir.mkdir(parents=True, exist_ok=True)
 
     new_dir = get_next_dir(base_dir)
@@ -256,6 +282,23 @@ Examples:
             time.sleep(args.delay)
 
     print(f"\n✓ Done! Processed {total} symbol(s).")
+
+    # Send Telegram notification
+    if is_sector:
+        groups_str = ', '.join(selected_groups)
+        msg = (
+            f"<b>✅ Initiate Complete</b>\n\n"
+            f"<b>Groups:</b> {groups_str}\n"
+            f"<b>Symbols:</b> {total}\n"
+            f"<b>Status:</b> Done"
+        )
+    else:
+        msg = (
+            f"<b>✅ Initiate Complete</b>\n\n"
+            f"<b>Symbol:</b> {symbols[0] if symbols else 'N/A'}\n"
+            f"<b>Status:</b> Done"
+        )
+    send_telegram(msg)
 
 
 if __name__ == "__main__":
