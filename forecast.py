@@ -24,8 +24,37 @@ import pandas as pd
 # NeuralForecast imports
 from neuralforecast import NeuralForecast
 from neuralforecast.models import LSTM, NBEATS, NHITS, TFT
+from neuralforecast.losses.pytorch import HuberLoss, DistributionLoss
 
 warnings.filterwarnings("ignore")
+
+# Model persistence directory
+MODELS_DIR = Path("models")
+MODELS_DIR.mkdir(exist_ok=True)
+
+# Groups config file
+GROUPS_FILE = MODELS_DIR / "groups.json"
+
+
+def load_groups() -> Dict[str, List[str]]:
+    """Load stock groups from config file."""
+    if not GROUPS_FILE.exists():
+        return {}
+    try:
+        with open(GROUPS_FILE, "r") as f:
+            groups = json.load(f)
+        # Remove comments
+        return {k: v for k, v in groups.items() if not k.startswith("_")}
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def find_group_for_symbol(symbol: str, groups: Dict[str, List[str]]) -> Optional[str]:
+    """Find which group a symbol belongs to."""
+    for group_name, symbols in groups.items():
+        if symbol.upper() in [s.upper() for s in symbols]:
+            return group_name
+    return None
 
 
 class MarketAlphaEngine:
@@ -266,7 +295,7 @@ class MarketAlphaEngine:
             "pct_change": pct_change,  # Price change %
         }
 
-    def load_symbol_data(self, symbol: str) -> pd.DataFrame:
+    def load_symbol_data(self, symbol: str, verbose: bool = True) -> pd.DataFrame:
         """Load all session data for a symbol."""
         symbol_path = self.base_path / symbol
         if not symbol_path.exists():
@@ -283,10 +312,11 @@ class MarketAlphaEngine:
             features = self.extract_session_features(symbol, session)
             if features:
                 features_list.append(features)
-                print(
-                    f"  Session {session}: close={features['y']:,.0f}, OBI={features['obi']:.3f}, "
-                    f"BuyConc={features['buy_concentration']:.2f}, ForeignNet={features['foreign_net']:,.0f}"
-                )
+                if verbose:
+                    print(
+                        f"  Session {session}: close={features['y']:,.0f}, OBI={features['obi']:.3f}, "
+                        f"BuyConc={features['buy_concentration']:.2f}, ForeignNet={features['foreign_net']:,.0f}"
+                    )
 
         if not features_list:
             raise ValueError(f"No valid data found for: {symbol}")
@@ -295,6 +325,33 @@ class MarketAlphaEngine:
         df = df.sort_values("ds").reset_index(drop=True)
 
         return df
+
+    def load_group_data(self, symbols: List[str]) -> pd.DataFrame:
+        """Load data for multiple symbols (for group training)."""
+        all_data = []
+        available = self.get_available_symbols()
+
+        for symbol in symbols:
+            if symbol not in available:
+                print(f"  Warning: {symbol} not found in sources, skipping")
+                continue
+
+            try:
+                print(f"\n  Loading {symbol}...")
+                df = self.load_symbol_data(symbol, verbose=False)
+                all_data.append(df)
+                print(f"    {len(df)} sessions loaded")
+            except ValueError as e:
+                print(f"  Warning: {symbol} - {e}")
+                continue
+
+        if not all_data:
+            raise ValueError("No data loaded for any symbol in group")
+
+        combined = pd.concat(all_data, ignore_index=True)
+        combined = combined.sort_values(["unique_id", "ds"]).reset_index(drop=True)
+
+        return combined
 
     def get_available_symbols(self) -> List[str]:
         """Get list of available symbols."""
@@ -403,12 +460,94 @@ class TickDataProcessor:
 class StockForecaster:
     """NeuralForecast-based stock price forecaster using TFT and ensemble."""
 
-    def __init__(self, horizon: int = 5):
+    def __init__(self, horizon: int = 5, symbol: str = "STOCK", group: str = None):
         self.horizon = horizon
+        self.symbol = symbol
+        self.group = group
         self.nf = None
 
+        # Use group name for model path if training with group
+        model_name = f"group_{group}" if group else f"forecast_{symbol}"
+        self.model_path = MODELS_DIR / model_name
+        self.meta_path = MODELS_DIR / f"{model_name}_meta.json"
+
+    def save_model(self, data_count: int):
+        """Save trained model and metadata to disk."""
+        if self.nf is None:
+            return
+
+        # Save the full NeuralForecast model
+        self.nf.save(str(self.model_path), overwrite=True)
+
+        # Also save individual model state_dicts for checkpoint resume
+        ckpt_dir = self.model_path / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        import torch
+        for i, model in enumerate(self.nf.models):
+            model_name = model.__class__.__name__
+            ckpt_path = ckpt_dir / f"{model_name}_{i}.pt"
+            torch.save(model.state_dict(), ckpt_path)
+
+        meta = {
+            "symbol": self.symbol,
+            "group": self.group,
+            "horizon": self.horizon,
+            "data_count": data_count,
+            "saved_at": datetime.now().isoformat(),
+            "model_names": [m.__class__.__name__ for m in self.nf.models],
+        }
+        with open(self.meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        model_type = f"group '{self.group}'" if self.group else self.symbol
+        print(f"  Model saved: {self.model_path} ({model_type})")
+
+    def load_model(self) -> Optional[dict]:
+        """Load saved model and metadata if available."""
+        if not self.model_path.exists() or not self.meta_path.exists():
+            return None
+
+        try:
+            with open(self.meta_path, "r") as f:
+                meta = json.load(f)
+
+            self.nf = NeuralForecast.load(str(self.model_path))
+            print(f"  Loaded saved model (trained on {meta['data_count']} records)")
+            return meta
+        except Exception as e:
+            print(f"  Could not load saved model: {e}")
+            return None
+
+    def load_checkpoints_into_models(self, models: list) -> list:
+        """Load saved checkpoints into new model instances for warm-start training."""
+        ckpt_dir = self.model_path / "checkpoints"
+        if not ckpt_dir.exists():
+            return models
+
+        import torch
+        loaded_count = 0
+
+        for i, model in enumerate(models):
+            model_name = model.__class__.__name__
+            ckpt_path = ckpt_dir / f"{model_name}_{i}.pt"
+
+            if ckpt_path.exists():
+                try:
+                    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                    # Load with strict=False to handle minor architecture differences
+                    model.load_state_dict(state_dict, strict=False)
+                    loaded_count += 1
+                except Exception as e:
+                    print(f"    Warning: Could not load checkpoint for {model_name}: {e}")
+
+        if loaded_count > 0:
+            print(f"  Loaded {loaded_count}/{len(models)} model checkpoints (warm-start)")
+
+        return models
+
     def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-        """Prepare data in NeuralForecast format with alpha features."""
+        """Prepare data in NeuralForecast format with alpha features and gap handling."""
 
         # Define exogenous features for TFT attention
         exog_features = [
@@ -432,90 +571,203 @@ class StockForecaster:
         for col in available_exog:
             nf_df[col] = df[col].fillna(0)
 
+        # Handle gaps in time series by adding available_mask
+        # This tells NeuralForecast which rows have real data vs filled gaps
+        nf_df = self._fill_gaps_with_mask(nf_df)
+
         # Clean data
         nf_df = nf_df.replace([np.inf, -np.inf], 0).fillna(0)
 
         return nf_df, available_exog
 
-    def create_models(self, input_size: int, exog_vars: List[str]):
-        """Create models including TFT with attention on alpha features."""
+    def _fill_gaps_with_mask(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fill gaps in time series and add available_mask column."""
+        result_dfs = []
+
+        for uid in df["unique_id"].unique():
+            uid_df = df[df["unique_id"] == uid].copy()
+            uid_df = uid_df.sort_values("ds")
+
+            # Create complete date range (business days only for stock data)
+            min_date = uid_df["ds"].min()
+            max_date = uid_df["ds"].max()
+
+            # Generate all business days in range
+            all_dates = pd.date_range(start=min_date, end=max_date, freq="B")
+
+            # Create template with all dates
+            template = pd.DataFrame({"ds": all_dates, "unique_id": uid})
+
+            # Merge with actual data
+            merged = template.merge(uid_df, on=["ds", "unique_id"], how="left")
+
+            # Add available_mask: 1 for real data, 0 for gaps
+            merged["available_mask"] = merged["y"].notna().astype(float)
+
+            # Fill gaps with forward fill then backward fill for y
+            merged["y"] = merged["y"].ffill().bfill()
+
+            # Fill other numeric columns
+            for col in merged.columns:
+                if col not in ["ds", "unique_id", "available_mask"] and merged[col].dtype in ["float64", "int64"]:
+                    merged[col] = merged[col].ffill().bfill().fillna(0)
+
+            result_dfs.append(merged)
+
+        if result_dfs:
+            result = pd.concat(result_dfs, ignore_index=True)
+            gap_count = (result["available_mask"] == 0).sum()
+            if gap_count > 0:
+                print(f"  Filled {gap_count} gaps in time series (marked with available_mask=0)")
+            return result
+
+        return df
+
+    def create_models(self, input_size: int, exog_vars: List[str], max_steps: int = 200):
+        """Create models with improved loss functions for robust forecasting."""
 
         effective_input = max(min(input_size, 24), 2)
 
+        # Use HuberLoss for robustness to outliers (price gaps, big moves)
+        # Use DistributionLoss with StudentT for probabilistic forecasts with heavy tails
         models = [
-            # TFT: Temporal Fusion Transformer with attention on alpha features
-            # This model learns WHICH features matter most at each timestep
+            # TFT: Temporal Fusion Transformer with StudentT distribution
+            # Provides probabilistic forecasts with confidence intervals
+            # StudentT handles outliers better than Normal distribution
             TFT(
                 h=self.horizon,
                 input_size=effective_input,
                 hidden_size=32,
-                max_steps=200,
+                max_steps=max_steps,
                 scaler_type="robust",
+                loss=DistributionLoss(distribution="StudentT", level=[80, 90]),
                 random_seed=42,
             ),
-            # NBEATS: Interpretable basis decomposition
+            # NBEATS: Interpretable basis decomposition with HuberLoss
+            # HuberLoss is robust to outliers (combines MSE + MAE)
             NBEATS(
                 h=self.horizon,
                 input_size=effective_input,
-                max_steps=200,
+                max_steps=max_steps,
                 scaler_type="robust",
+                loss=HuberLoss(),
                 random_seed=42,
             ),
-            # NHITS: Multi-scale hierarchical
+            # NHITS: Multi-scale hierarchical with HuberLoss
             NHITS(
                 h=self.horizon,
                 input_size=effective_input,
-                max_steps=200,
+                max_steps=max_steps,
                 scaler_type="robust",
+                loss=HuberLoss(),
                 random_seed=42,
             ),
         ]
 
         return models
 
-    def train_and_forecast(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Train models and generate forecasts."""
+    def train_and_forecast(self, df: pd.DataFrame, force_retrain: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Train models and generate forecasts. Supports incremental training."""
 
         nf_df, exog_vars = self.prepare_data(df)
+        current_data_count = len(nf_df)
 
         print(f"\n{'=' * 60}")
         print("PREPARED TIME SERIES")
         print(f"{'=' * 60}")
-        print(f"  Records: {len(nf_df)}")
+        print(f"  Records: {current_data_count}")
         print(f"  Date range: {nf_df['ds'].min()} to {nf_df['ds'].max()}")
         print(f"  Price range: {nf_df['y'].min():,.2f} to {nf_df['y'].max():,.2f}")
         print(f"  Alpha features: {exog_vars}")
 
         # Auto-adjust horizon if not enough data
         min_records = 3  # Absolute minimum
-        if len(nf_df) < min_records:
-            raise ValueError(f"Need at least {min_records} records (have {len(nf_df)})")
+        if current_data_count < min_records:
+            raise ValueError(f"Need at least {min_records} records (have {current_data_count})")
 
         # Adjust horizon to fit available data
-        max_horizon = max(len(nf_df) - 2, 1)
+        max_horizon = max(current_data_count - 2, 1)
         if self.horizon > max_horizon:
-            print(f"  Note: Adjusting horizon from {self.horizon} to {max_horizon} (limited data)")
+            print(
+                f"  Note: Adjusting horizon from {self.horizon} to {max_horizon} (limited data)"
+            )
             self.horizon = max_horizon
 
         min_required = self.horizon + 2
-        if len(nf_df) < min_required:
+        if current_data_count < min_required:
             raise ValueError(
-                f"Need at least {min_required} records (have {len(nf_df)})"
+                f"Need at least {min_required} records (have {current_data_count})"
             )
 
-        input_size = max(len(nf_df) - self.horizon - 1, 2)
-        models = self.create_models(input_size, exog_vars)
+        input_size = max(current_data_count - self.horizon - 1, 2)
+
+        # Check for saved model and determine training strategy
+        saved_meta = None if force_retrain else self.load_model()
+        use_fine_tuning = False
+        max_steps = 200
+
+        if saved_meta is not None:
+            prev_count = saved_meta.get("data_count", 0)
+            new_data = current_data_count - prev_count
+
+            if new_data > 0:
+                print(f"\n  New data detected: {new_data} records ({prev_count} -> {current_data_count})")
+                print(f"  Strategy: Fine-tuning with reduced steps")
+                use_fine_tuning = True
+                max_steps = 50  # Reduced steps for fine-tuning
+            elif new_data == 0:
+                print(f"\n  No new data. Using saved model directly.")
+                # Just predict with existing model
+                print(f"\nGenerating {self.horizon}-step forecast (using cached model)...")
+
+                # Predict only for requested symbol if using group training
+                if self.group and self.symbol:
+                    symbol_df = nf_df[nf_df["unique_id"] == self.symbol].copy()
+                    if not symbol_df.empty:
+                        forecasts = self.nf.predict(df=symbol_df)
+                    else:
+                        forecasts = self.nf.predict()
+                else:
+                    forecasts = self.nf.predict()
+
+                return forecasts, nf_df
+            else:
+                print(f"\n  Data reduced. Retraining from scratch.")
+                saved_meta = None
+
+        if saved_meta is None:
+            print(f"\n  Strategy: Training from scratch (no saved model)")
+
+        models = self.create_models(input_size, exog_vars, max_steps=max_steps)
+
+        # For fine-tuning: load saved weights into new models (warm-start)
+        if use_fine_tuning:
+            models = self.load_checkpoints_into_models(models)
 
         print(f"\nModels: {[m.__class__.__name__ for m in models]}")
         print(f"Lookback: {min(input_size, 24)} | Horizon: {self.horizon}")
+        print(f"Max steps: {max_steps}" + (" (warm-start fine-tuning)" if use_fine_tuning else " (full training)"))
 
         # Initialize and train
         self.nf = NeuralForecast(models=models, freq="D")
         self.nf.fit(df=nf_df)
 
-        # Predict
+        # Save model for future use
+        self.save_model(current_data_count)
+
+        # Predict - only for requested symbol if using group training
         print(f"\nGenerating {self.horizon}-step forecast...")
-        forecasts = self.nf.predict()
+        if self.group and self.symbol:
+            # Filter input data to only the requested symbol for prediction
+            symbol_df = nf_df[nf_df["unique_id"] == self.symbol].copy()
+            if not symbol_df.empty:
+                forecasts = self.nf.predict(df=symbol_df)
+                print(f"  Predicting for {self.symbol} only")
+            else:
+                print(f"  Warning: {self.symbol} not found in group data, predicting all")
+                forecasts = self.nf.predict()
+        else:
+            forecasts = self.nf.predict()
 
         return forecasts, nf_df
 
@@ -700,12 +952,12 @@ def plot_results(
 
         plt.tight_layout()
 
-        output_path = (
-            f"forecast_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        )
+        plot_dir = Path("plot")
+        plot_dir.mkdir(exist_ok=True)
+        output_path = plot_dir / f"forecast_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {output_path}")
-        plt.show()
+        plt.close()
 
     except ImportError:
         print("\nMatplotlib not available")
@@ -732,20 +984,39 @@ Examples:
 
     parser.add_argument("symbol", nargs="?", help="Stock symbol")
     parser.add_argument("--horizon", "-n", type=int, default=5, help="Forecast horizon")
-    parser.add_argument("--plot", "-p", action="store_true", help="Show plots")
+    parser.add_argument("--no-plot", action="store_true", help="Disable plot generation")
     parser.add_argument("--list", "-l", action="store_true", help="List symbols")
     parser.add_argument("--source", "-s", default="sources", help="Data directory")
+    parser.add_argument("--retrain", "-r", action="store_true", help="Force retrain from scratch (ignore saved model)")
+    parser.add_argument("--group", "-g", help="Train with symbol group (e.g., 'banking', 'mining'). Edit models/groups.json to define groups.")
+    parser.add_argument("--list-groups", action="store_true", help="List available groups")
 
     args = parser.parse_args()
 
     engine = MarketAlphaEngine(args.source)
+    groups = load_groups()
+
+    # List groups
+    if args.list_groups:
+        if not groups:
+            print("No groups defined. Create models/groups.json to define groups.")
+        else:
+            print("Available groups (edit models/groups.json to modify):")
+            for name, symbols in groups.items():
+                available = [s for s in symbols if s in engine.get_available_symbols()]
+                print(f"  {name}: {', '.join(symbols)}")
+                if available:
+                    print(f"    (available in sources: {', '.join(available)})")
+        return
 
     if args.list:
         symbols = engine.get_available_symbols()
         print("Available symbols:")
         for s in sorted(symbols):
             sessions = len(list((engine.base_path / s).iterdir()))
-            print(f"  {s}: {sessions} session(s)")
+            group = find_group_for_symbol(s, groups)
+            group_str = f" [{group}]" if group else ""
+            print(f"  {s}: {sessions} session(s){group_str}")
         return
 
     if not args.symbol:
@@ -759,34 +1030,57 @@ Examples:
         print(f"Available: {', '.join(sorted(engine.get_available_symbols()))}")
         sys.exit(1)
 
+    # Determine group to use
+    group_name = args.group
+    if group_name and group_name not in groups:
+        print(f"Error: Group '{group_name}' not found")
+        print(f"Available groups: {', '.join(groups.keys())}")
+        print("Edit models/groups.json to add groups.")
+        sys.exit(1)
+
     print(f"\n{'=' * 70}")
     print(f"STOCK FORECASTER - {symbol}")
     print(f"{'=' * 70}")
     print("Using: TFT (Temporal Fusion Transformer) + NBEATS + NHITS")
     print(f"Horizon: {args.horizon} periods")
+    if group_name:
+        print(f"Group training: {group_name} ({', '.join(groups[group_name])})")
 
     try:
-        print(f"\nLoading alpha features for {symbol}...")
-        df = engine.load_symbol_data(symbol)
+        # Load data based on group or single symbol
+        if group_name:
+            print(f"\nLoading group '{group_name}' data...")
+            df = engine.load_group_data(groups[group_name])
+            symbols_loaded = df["unique_id"].nunique()
+            print(f"\nLoaded {len(df)} total sessions from {symbols_loaded} symbols")
+        else:
+            print(f"\nLoading alpha features for {symbol}...")
+            df = engine.load_symbol_data(symbol)
+            print(f"\nLoaded {len(df)} sessions")
 
-        print(f"\nLoaded {len(df)} sessions")
         print(f"Price range: {df['y'].min():,.2f} - {df['y'].max():,.2f}")
-        print(f"Last price: {df['y'].iloc[-1]:,.2f}")
+
+        # Get last price for the target symbol
+        symbol_data = df[df["unique_id"] == symbol] if group_name else df
+        last_price = symbol_data["y"].iloc[-1] if not symbol_data.empty else df["y"].iloc[-1]
+        print(f"Last price ({symbol}): {last_price:,.2f}")
 
         # Show alpha feature summary
-        print(f"\nAlpha Feature Summary:")
+        print("\nAlpha Feature Summary:")
         print(f"  OBI range: {df['obi'].min():.3f} to {df['obi'].max():.3f}")
         print(f"  Buy Concentration avg: {df['buy_concentration'].mean():.2%}")
         print(f"  Foreign Net total: {df['foreign_net'].sum():,.0f}")
 
-        forecaster = StockForecaster(horizon=args.horizon)
-        forecasts, historical = forecaster.train_and_forecast(df)
+        forecaster = StockForecaster(horizon=args.horizon, symbol=symbol, group=group_name)
+        forecasts, historical = forecaster.train_and_forecast(df, force_retrain=args.retrain)
         forecasts = forecaster.ensemble_forecast(forecasts)
 
-        print_forecast_table(forecasts, symbol, df["y"].iloc[-1])
+        print_forecast_table(forecasts, symbol, last_price)
 
-        if args.plot:
-            plot_results(historical, forecasts, symbol, df)
+        if not args.no_plot:
+            # Use symbol-specific data for plots when using group training
+            plot_data = symbol_data if group_name and not symbol_data.empty else df
+            plot_results(historical, forecasts, symbol, plot_data)
 
         output_file = (
             f"forecast_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"

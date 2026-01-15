@@ -8,11 +8,13 @@ Usage:
     python yf.py BBRI.JK --horizon 10      # Indonesian stock
     python yf.py AAPL --interval 1h        # Hourly data
     python yf.py AAPL --period 6mo --plot  # 6 months history with chart
+    python yf.py BBYB.JK,BBCA.JK,BMRI.JK   # Multiple symbols (comma-separated)
 
 Examples:
     python yf.py AAPL --horizon 5 --plot
     python yf.py BBRI.JK --interval 1d --horizon 10
     python yf.py TSLA --interval 1h --period 5d --horizon 24
+    python yf.py BBYB.JK,BBCA.JK,BMRI.JK --horizon 5
 """
 
 import argparse
@@ -368,10 +370,13 @@ def plot_forecast(df: pd.DataFrame, forecasts: pd.DataFrame, symbol: str, name: 
 
         plt.tight_layout()
 
-        out = f"yf_{symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        from pathlib import Path
+        plot_dir = Path("plot")
+        plot_dir.mkdir(exist_ok=True)
+        out = plot_dir / f"yf_{symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(out, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {out}")
-        plt.show()
+        plt.close()
 
     except ImportError:
         print("\nMatplotlib not available")
@@ -397,14 +402,15 @@ Examples:
     python yf.py TSLA --interval 1h --period 5d --horizon 24
     python yf.py GOOGL --period 1y --plot      # 1 year history with chart
     python yf.py ^GSPC --horizon 10            # S&P 500 index
+    python yf.py BBYB.JK,BBCA.JK,BMRI.JK       # Multiple symbols (comma-separated)
         """
     )
 
-    parser.add_argument("symbol", nargs="?", help="Stock symbol (e.g., AAPL, BBRI.JK, ^GSPC)")
+    parser.add_argument("symbol", nargs="?", help="Stock symbol(s) - single (AAPL) or comma-separated (AAPL,GOOGL,TSLA)")
     parser.add_argument("--horizon", "-n", type=int, default=5, help="Forecast horizon (default: 5)")
     parser.add_argument("--interval", "-i", default="1d", help="Data interval (default: 1d)")
     parser.add_argument("--period", "-P", default="3mo", help="History period (default: 3mo)")
-    parser.add_argument("--plot", "-p", action="store_true", help="Show chart")
+    parser.add_argument("--no-plot", action="store_true", help="Disable chart generation")
 
     args = parser.parse_args()
 
@@ -412,47 +418,83 @@ Examples:
         parser.print_help()
         sys.exit(1)
 
-    symbol = args.symbol.upper()
+    # Parse symbols (support comma-separated)
+    symbols = [s.strip().upper() for s in args.symbol.split(",") if s.strip()]
+
+    if not symbols:
+        print("Error: No valid symbols provided")
+        sys.exit(1)
 
     print(f"\n{'=' * 70}")
     print(f"YAHOO FINANCE FORECASTER")
     print(f"{'=' * 70}")
+    print(f"Symbols to process: {', '.join(symbols)}")
 
-    try:
-        # Load data
-        loader = YFinanceLoader(symbol)
-        name = loader.get_name()
-        currency = loader.get_currency()
+    results = []
+    errors = []
 
-        print(f"Symbol: {symbol}")
-        print(f"Name: {name}")
-        print(f"Currency: {currency}")
+    for i, symbol in enumerate(symbols, 1):
+        print(f"\n{'#' * 70}")
+        print(f"# [{i}/{len(symbols)}] Processing: {symbol}")
+        print(f"{'#' * 70}")
 
-        df = loader.load_data(period=args.period, interval=args.interval)
-        df = loader.add_features(df)
+        try:
+            # Load data
+            loader = YFinanceLoader(symbol)
+            name = loader.get_name()
+            currency = loader.get_currency()
 
-        print(f"Loaded {len(df)} records")
+            print(f"Symbol: {symbol}")
+            print(f"Name: {name}")
+            print(f"Currency: {currency}")
 
-        # Forecast
-        forecaster = YFinanceForecaster(horizon=args.horizon, interval=args.interval)
-        forecasts, historical, meta = forecaster.forecast(df)
+            df = loader.load_data(period=args.period, interval=args.interval)
+            df = loader.add_features(df)
 
-        # Results
-        print_results(forecasts, df["close"].iloc[-1], symbol, currency)
+            print(f"Loaded {len(df)} records")
 
-        # Plot
-        if args.plot:
-            plot_forecast(df, forecasts, symbol, name)
+            # Forecast
+            forecaster = YFinanceForecaster(horizon=args.horizon, interval=args.interval)
+            forecasts, historical, meta = forecaster.forecast(df)
 
-        # Save
-        out = f"yf_{symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        forecasts.to_csv(out, index=False)
-        print(f"\nSaved: {out}")
+            # Results
+            print_results(forecasts, df["close"].iloc[-1], symbol, currency)
 
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
+            # Plot
+            if not args.no_plot:
+                plot_forecast(df, forecasts, symbol, name)
+
+            # Save
+            out = f"yf_{symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            forecasts.to_csv(out, index=False)
+            print(f"\nSaved: {out}")
+
+            results.append({"symbol": symbol, "status": "success", "file": out})
+
+        except Exception as e:
+            print(f"\nError processing {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            errors.append({"symbol": symbol, "error": str(e)})
+
+    # Summary for multiple symbols
+    if len(symbols) > 1:
+        print(f"\n{'=' * 70}")
+        print(f"BATCH SUMMARY")
+        print(f"{'=' * 70}")
+        print(f"  Total: {len(symbols)}")
+        print(f"  Success: {len(results)}")
+        print(f"  Failed: {len(errors)}")
+        if results:
+            print(f"\n  Successful:")
+            for r in results:
+                print(f"    - {r['symbol']}: {r['file']}")
+        if errors:
+            print(f"\n  Failed:")
+            for e in errors:
+                print(f"    - {e['symbol']}: {e['error']}")
+
+    if errors and not results:
         sys.exit(1)
 
 

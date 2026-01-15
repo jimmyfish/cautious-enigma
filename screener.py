@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
-import sys
-import os
 import json
-import requests
+import os
+import sys
 from pathlib import Path
+
+import requests
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,7 +21,7 @@ def normalize_auth(token):
 def fetch_screener(template_id: int, auth_token: str, output_path: Path):
     """Fetch screener template results and save to JSON file."""
     url = f"https://exodus.stockbit.com/screener/templates/{template_id}?type=TEMPLATE_TYPE_CUSTOM"
-    
+
     headers = {
         "Accept": "application/json",
         "Authorization": auth_token or "",
@@ -34,15 +35,15 @@ def fetch_screener(template_id: int, auth_token: str, output_path: Path):
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
     }
-    
+
     try:
         print(f"Fetching screener template {template_id}...")
         res = requests.get(url, headers=headers)
         res.raise_for_status()
-        
+
         data = res.json()
         output_path.write_text(json.dumps(data, indent=4, ensure_ascii=False))
-        
+
         # Extract and display summary
         if "data" in data and "calcs" in data["data"]:
             symbols = [calc["company"]["symbol"] for calc in data["data"]["calcs"]]
@@ -53,11 +54,11 @@ def fetch_screener(template_id: int, auth_token: str, output_path: Path):
             print(f"✓ Fetched screener data")
             print(f"  Saved to: {output_path}")
             print(f"  Warning: Unexpected response structure")
-        
+
         return True
     except requests.exceptions.RequestException as e:
         print(f"✗ Failed to fetch screener: {e}")
-        if hasattr(e, 'response') and e.response is not None:
+        if hasattr(e, "response") and e.response is not None:
             print(f"  Response status: {e.response.status_code}")
             print(f"  Response body: {e.response.text[:200]}")
         return False
@@ -69,35 +70,37 @@ def fetch_screener(template_id: int, auth_token: str, output_path: Path):
 def main():
     # Default screener template ID from the example
     default_template_id = 4475032
-    
+
     # Parse command line arguments
     if len(sys.argv) > 1:
         try:
             template_id = int(sys.argv[1])
         except ValueError:
             print(f"Error: Invalid template ID '{sys.argv[1]}'. Must be a number.")
-            print(f"Usage: python screener.py [TEMPLATE_ID]")
-            print(f"  TEMPLATE_ID: Screener template ID (default: {default_template_id})")
+            print("Usage: python screener.py [TEMPLATE_ID]")
+            print(
+                f"  TEMPLATE_ID: Screener template ID (default: {default_template_id})"
+            )
             sys.exit(1)
     else:
         template_id = default_template_id
-    
+
     # Get auth token from environment
     sb_auth = normalize_auth(os.getenv("SB_AUTH"))
-    
+
     if not sb_auth:
         print("!!! SB_AUTH not set in .env file !!!")
         print("Please set SB_AUTH in your .env file:")
         print("  SB_AUTH=Bearer YOUR_TOKEN_HERE")
         sys.exit(1)
-    
+
     # Output path: screener.json in workspace root
     workspace_root = Path(__file__).resolve().parent
     output_path = workspace_root / "screener.json"
-    
+
     # Fetch and save screener data
     success = fetch_screener(template_id, sb_auth, output_path)
-    
+
     if success:
         print("\n✓ Screener data fetched successfully!")
     else:

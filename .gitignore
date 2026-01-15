@@ -5,3 +5,4 @@ sources/
 lightning_logs/
 *.csv
 *.png
+subsectors.md

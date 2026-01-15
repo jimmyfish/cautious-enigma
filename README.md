@@ -10,6 +10,10 @@ A command-line toolkit for analyzing Indonesian Stock Exchange (IDX) stocks. Pro
 - **Technical Analytics** - Generate structured analytics including price trends, volatility, support/resistance levels
 - **Bulk Analysis Reports** - Create comprehensive markdown reports analyzing multiple stocks simultaneously
 - **Bandar Detection** - Identify accumulation/distribution signals from market maker activity
+- **Price Forecasting** - Neural network-based price predictions using TFT, NBEATS, NHITS models
+- **Intraday Forecasting** - Session-level forecasts for next trading day using tick data
+- **Group Training** - Train models on stock groups (banking, mining, etc.) for better pattern recognition
+- **Model Persistence** - Save and resume training with checkpoint support for incremental learning
 
 ## Setup
 
@@ -84,6 +88,61 @@ python scripts/analyze_market.py BBRI 1
 
 Output: `sources/BBRI/1/analysis-data-{timestamp}.json`
 
+### Price Forecasting (Daily)
+
+```bash
+# Basic forecast (5-day horizon)
+python forecast.py BBRI
+
+# Custom horizon
+python forecast.py BBRI --horizon 10
+
+# Group training (train with all banking stocks)
+python forecast.py BBCA --group banking
+
+# Force retrain (ignore saved model)
+python forecast.py BBRI --retrain
+
+# List available symbols and groups
+python forecast.py --list
+python forecast.py --list-groups
+```
+
+Output: `forecast_BBRI_{timestamp}.csv` with predictions and confidence intervals
+
+### Intraday Forecasting
+
+```bash
+# Forecast next session 1 (09:00-12:00)
+python short.py ICBP --session1
+
+# Forecast next session 2 (13:30-15:50)
+python short.py ICBP --session2
+
+# Custom duration
+python short.py ICBP --hours 2
+
+# Group training
+python short.py BBCA --group banking --session1
+
+# Disable auto-plot
+python short.py ICBP --session1 --no-plot
+```
+
+Output: `short_ICBP_{timestamp}.csv` with intraday predictions
+
+### Configure Stock Groups
+
+Edit `models/groups.json` to define your stock groups:
+
+```json
+{
+  "banking": ["BBCA", "BBRI", "BMRI", "BBNI"],
+  "mining": ["ANTM", "INCO", "MDKA", "PTBA"],
+  "consumer": ["ICBP", "INDF", "UNVR", "MYOR"]
+}
+```
+
 ### Run Bulk Analysis (Full Workflow)
 
 ```bash
@@ -105,12 +164,20 @@ helpme/
 ├── screener.py           # Fetch screener template results
 ├── initiate.py           # Initialize market data for a symbol
 ├── analyze_bsjp.py       # Bulk analysis orchestrator
+├── forecast.py           # Daily price forecasting (NeuralForecast)
+├── short.py              # Intraday session forecasting
 ├── scripts/
 │   └── analyze_market.py # Analytics pipeline
 ├── sources/              # Data storage
 │   ├── {SYMBOL}/
 │   │   └── {SESSION}/    # Session directories (1, 2, 3...)
 │   └── BULK_BSJP/        # Bulk analysis reports
+├── models/               # Saved models and config
+│   ├── groups.json       # Stock group definitions
+│   ├── forecast_{SYMBOL}/    # Daily forecast models
+│   ├── short_{SYMBOL}_{interval}min/  # Intraday models
+│   └── group_{name}/     # Group-trained models
+├── plot/                 # Generated charts
 ├── requirements.txt
 ├── .env                  # API credentials (not in git)
 └── README.md
@@ -139,6 +206,34 @@ The analytics pipeline generates these key metrics:
 - **Foreign Flow**: Net foreign investment, participation percentage
 - **Bandar Signal**: Accumulation/distribution detection
 - **Short-Term Outlook**: Bullish/Bearish/Neutral recommendation
+
+## Forecasting Models
+
+The forecasting tools use **NeuralForecast** with these neural network architectures:
+
+| Model | Type | Loss Function | Output |
+|-------|------|---------------|--------|
+| TFT | Temporal Fusion Transformer | StudentT Distribution | Point + 80%/90% confidence intervals |
+| NBEATS | Basis decomposition | HuberLoss | Point forecast (robust to outliers) |
+| NHITS | Multi-scale hierarchical | HuberLoss / StudentT | Point + confidence intervals |
+| LSTM | Recurrent neural network | HuberLoss | Point forecast |
+
+### Key Features
+
+- **Model Persistence**: Models are saved after training and reused. New data triggers fine-tuning with warm-start (faster training).
+- **Gap Handling**: Missing dates/bars are automatically filled with `available_mask` so models can handle incomplete data.
+- **Group Training**: Train on multiple related stocks (e.g., all banking stocks) to learn common patterns.
+- **Robust Loss Functions**: HuberLoss handles price outliers (gaps, big moves). StudentT distribution handles heavy tails.
+
+### Alpha Features Used
+
+The models learn from these market signals:
+
+- **OBI** (Orderbook Imbalance) - Buy/sell pressure from order depth
+- **Bandar Concentration** - Top broker activity indicating institutional moves
+- **Foreign Flow** - Net foreign transaction value
+- **Volatility** - Intraday price range
+- **AccDist Signal** - Accumulation/distribution patterns
 
 ## License
 

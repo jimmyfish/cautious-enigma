@@ -17,10 +17,28 @@ This is a command-line Python application with script-based workflows. It follow
 
 - **requests** - HTTP client for API calls to Stockbit
 - **python-dotenv** - Environment variable management for API tokens
-- **pandas** - Data manipulation (available but sparingly used)
+- **pandas** - Data manipulation and time series handling
 - **NumPy** - Numerical operations
 - **yfinance** - Yahoo Finance data (secondary data source)
 - **ccxt** - Cryptocurrency exchange library (available for potential cross-market analysis)
+
+### Forecasting Stack
+
+- **NeuralForecast** - Neural network time series forecasting library (Nixtla)
+  - TFT (Temporal Fusion Transformer) - Attention-based model with interpretable features
+  - NBEATS - Basis decomposition model
+  - NHITS - Multi-scale hierarchical interpolation
+  - LSTM - Recurrent neural network
+- **PyTorch** - Deep learning backend for NeuralForecast
+- **PyTorch Lightning** - Training framework (used internally by NeuralForecast)
+
+### Loss Functions (neuralforecast.losses.pytorch)
+
+- **HuberLoss** - Robust to outliers (combines MSE + MAE)
+- **DistributionLoss** - Probabilistic forecasts with confidence intervals
+  - StudentT distribution - Heavy-tailed, handles market extremes
+  - Poisson - For count data (volume forecasting)
+  - NegativeBinomial - Overdispersed count data
 
 ## External APIs
 
@@ -67,6 +85,21 @@ python scripts/analyze_market.py BBRI 1
 
 # Run bulk analysis workflow
 python analyze_bsjp.py
+
+# Daily price forecasting
+python forecast.py BBRI                    # Basic 5-day forecast
+python forecast.py BBRI --horizon 10       # 10-day forecast
+python forecast.py BBCA --group banking    # Group training
+python forecast.py BBRI --retrain          # Force retrain
+
+# Intraday forecasting
+python short.py ICBP --session1            # Morning session forecast
+python short.py ICBP --session2            # Afternoon session forecast
+python short.py BBCA --group banking       # Group training
+
+# List available options
+python forecast.py --list                  # List symbols
+python forecast.py --list-groups           # List stock groups
 ```
 
 ## Environment Variables
@@ -80,3 +113,18 @@ python analyze_bsjp.py
 - All market data stored as JSON files in `sources/{SYMBOL}/{SESSION}/`
 - Analysis reports stored as markdown in `sources/BULK_BSJP/`
 - Session directories are auto-incremented integers (1, 2, 3, ...)
+
+### Model Storage
+
+- Trained models saved in `models/` directory
+- `models/groups.json` - Stock group definitions for group training
+- `models/forecast_{SYMBOL}/` - Daily forecast model checkpoints
+- `models/short_{SYMBOL}_{interval}min/` - Intraday model checkpoints
+- `models/group_{name}/` - Group-trained model checkpoints
+- `models/*_meta.json` - Model metadata (data count, training date)
+
+### Output Files
+
+- `forecast_{SYMBOL}_{timestamp}.csv` - Daily forecast results
+- `short_{SYMBOL}_{timestamp}.csv` - Intraday forecast results
+- `plot/` - Generated charts (PNG)
