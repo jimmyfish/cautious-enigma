@@ -48,14 +48,41 @@ sources/
 
 | File | Source | Content |
 |------|--------|---------|
-| `market-detector.json` | Stockbit API | Bandar detector, broker summary, foreign buyers |
-| `price-feed.json` | Stockbit API | OHLC prices, bid/offer levels, foreign net |
-| `orderbook.json` | Stockbit API | Full order book depth |
+| `market-detector.json` | Stockbit API | Bandar detector, broker summary (7 days) |
+| `price-feed.json` | Stockbit API | Historical daily OHLCV + foreign flow (50 days) |
+| `orderbook.json` | Stockbit API | Real-time order book depth (bid/offer levels) |
 | `running-trade.json` | Stockbit API | Price chart data, broker chart data |
-| `today-running-trade.json` | Stockbit API | Recent trade-by-trade data |
+| `today-running-trade.json` | Stockbit API | Recent trade-by-trade tick data |
 | `findata.json` | Stockbit API | Foreign vs domestic flow breakdown |
-| `analysis-data-*.json` | Generated | Structured analytics summary |
+| `analyzed.json` | Generated | Comprehensive summary of all data sources |
+| `.last_session` | Generated | Session counter for efficient directory numbering |
+| `analysis-data-*.json` | Generated | Structured analytics summary (legacy) |
 | `analysis-bulk-*.md` | Generated | Markdown report for bulk analysis |
+
+### price-feed.json Structure (Historical API)
+
+The historical price feed contains rich daily data:
+
+```json
+{
+  "data": {
+    "result": [
+      {
+        "date": "2026-01-15",
+        "open": 8000, "high": 8175, "low": 7975, "close": 8075,
+        "volume": 1517531, "value": 1227841697500, "frequency": 26293,
+        "foreign_buy": 736957717500, "foreign_sell": 793577152500,
+        "net_foreign": -56619435000,
+        "change": 75, "change_percentage": 0.9375
+      }
+    ],
+    "paginate": { "next_page": "2" }
+  }
+}
+```
+
+- **Pagination**: Max 50 items per page, use `page=2` for more
+- **Foreign data**: Per-day foreign_buy, foreign_sell, net_foreign included
 
 ## Code Organization Patterns
 
@@ -71,3 +98,30 @@ sources/
 3. **Fail-soft data collection** - Missing data sources are noted but don't block analysis
 4. **Environment-based auth** - API credentials loaded from `.env` file
 5. **Markdown reports** - Human-readable output format with tables and structure
+6. **Connection pooling** - `requests.Session()` reuses TCP connections for efficiency
+7. **Symbol deduplication** - Symbols appearing in multiple groups are processed only once
+8. **Efficient session counting** - `.last_session` file avoids full directory scans
+
+## initiate.py Architecture
+
+```
+main()
+├── Parse args (-g groups, -j jobs, -e exclude)
+├── Load groups from groups.json
+├── Deduplicate symbols
+├── Create requests.Session() with headers
+└── ThreadPoolExecutor(max_workers=jobs)
+    └── process_symbol() for each symbol
+        ├── Create session directory
+        ├── ThreadPoolExecutor(max_workers=6)
+        │   └── fetch_json_task() × 6 endpoints
+        ├── generate_analysis() → analyzed.json
+        └── Cleanup source JSON files
+```
+
+### Concurrency Model
+
+- **Outer loop**: `jobs` symbols processed in parallel (default: 3)
+- **Inner loop**: 6 API endpoints fetched in parallel per symbol
+- **Total concurrent requests**: `jobs × 6`
+- **Rate limiting**: Exponential backoff on 429/5xx errors

@@ -69,16 +69,32 @@ Output: `screener.json` in project root
 ### Initialize Data for a Symbol
 
 ```bash
+# Single symbol
 python initiate.py BBRI
+
+# Process a group
+python initiate.py -g banking
+
+# Process multiple groups
+python initiate.py -g banking,mining
+
+# Exclude groups (process all except)
+python initiate.py -e banking
+
+# Control concurrency (default: 3)
+python initiate.py -g banking -j 2    # Balanced (12 concurrent requests)
+python initiate.py -g banking -j 1    # Safest (6 concurrent requests)
+python initiate.py -g banking -j 5    # Aggressive (30 concurrent requests)
 ```
 
 This creates a new session directory under `sources/BBRI/{session}/` and fetches:
-- `market-detector.json` - Bandar detector and broker summary
-- `price-feed.json` - Current OHLC and bid/offer levels
-- `orderbook.json` - Full order book depth
+- `market-detector.json` - Bandar detector and broker summary (7 days)
+- `price-feed.json` - Historical daily OHLCV + foreign flow (50 days)
+- `orderbook.json` - Full order book depth (real-time snapshot)
 - `running-trade.json` - Price chart and broker chart data
 - `today-running-trade.json` - Recent trade-by-trade data
 - `findata.json` - Foreign vs domestic flow breakdown
+- `analyzed.json` - Generated summary of all data sources
 
 ### Generate Analytics
 
@@ -190,11 +206,23 @@ All data is fetched from **Stockbit Exodus API** (`exodus.stockbit.com`):
 | Endpoint | Description |
 |----------|-------------|
 | `/screener/templates/{id}` | Custom screener results |
-| `/marketdetectors/{symbol}` | Market detector / bandar analysis |
-| `/company-price-feed/v2/orderbook/companies/{symbol}` | Price feed and order book |
+| `/marketdetectors/{symbol}` | Market detector / bandar analysis (7 days) |
+| `/company-price-feed/historical/summary/{symbol}` | Historical daily OHLCV + foreign flow (50 days) |
+| `/company-price-feed/v2/orderbook/companies/{symbol}` | Real-time order book depth |
 | `/order-trade/running-trade/chart/{symbol}` | Running trade chart data |
 | `/order-trade/running-trade` | Today's running trades |
 | `/findata-view/foreign-domestic/v1/chart-data/{symbol}` | Foreign/domestic flow |
+
+### Concurrency Recommendations
+
+The `-j` flag controls how many symbols are processed in parallel. Each symbol makes 6 concurrent API requests.
+
+| Mode | Flag | Concurrent Requests | Risk Level |
+|------|------|---------------------|------------|
+| Safest | `-j 1` | 6 | None |
+| Balanced | `-j 2` | 12 | Low |
+| Default | `-j 3` | 18 | Medium |
+| Aggressive | `-j 5` | 30 | High (may trigger retries) |
 
 ## Analysis Metrics
 

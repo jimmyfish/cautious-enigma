@@ -44,10 +44,19 @@ This is a command-line Python application with script-based workflows. It follow
 
 - **Stockbit Exodus API** (`exodus.stockbit.com`) - Primary data source
   - Screener templates
-  - Price feeds and order books
-  - Running trades
-  - Market detector (bandar analysis)
+  - Historical price feed (50 days daily OHLCV + foreign flow per day)
+  - Real-time order book depth
+  - Running trades (chart + tick data)
+  - Market detector (bandar analysis, 7 days)
   - Foreign/domestic flow data (findata)
+
+### API Rate Limiting
+
+- API may return 429 when too many concurrent requests
+- `initiate.py` uses retry with exponential backoff
+- Each symbol makes 6 concurrent API calls
+- `-j` flag controls parallel symbol processing (default: 3)
+- Recommended: `-j 2` for safe operation, `-j 1` if experiencing issues
 
 ## Development Environment
 
@@ -80,6 +89,13 @@ python screener.py 4475032
 # Initialize data for a symbol
 python initiate.py BBRI
 
+# Initialize data for a group (with concurrency control)
+python initiate.py -g banking              # Default concurrency (3 symbols)
+python initiate.py -g banking -j 2         # Balanced (2 symbols = 12 requests)
+python initiate.py -g banking -j 1         # Safest (1 symbol = 6 requests)
+python initiate.py -g banking,mining       # Multiple groups
+python initiate.py -e banking              # All except banking
+
 # Generate analytics for a symbol/session
 python scripts/analyze_market.py BBRI 1
 
@@ -100,6 +116,7 @@ python short.py BBCA --group banking       # Group training
 # List available options
 python forecast.py --list                  # List symbols
 python forecast.py --list-groups           # List stock groups
+python initiate.py --list-sectors          # List available groups
 ```
 
 ## Environment Variables
