@@ -21,16 +21,28 @@ import argparse
 import sys
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+# IDX ARA/ARB rules (only for Indonesian stocks)
+from idx_rules import (
+    add_ara_arb_features,
+    clamp_forecast_series,
+    get_daily_limit_info,
+    is_indonesian_stock,
+)
 from neuralforecast import NeuralForecast
 from neuralforecast.models import NBEATS, NHITS, LSTM
 
 warnings.filterwarnings("ignore")
 
+# CSV output directory
+CSV_DIR = Path("csv")
+CSV_DIR.mkdir(exist_ok=True)
 
 # Valid yfinance intervals and their max periods
 VALID_INTERVALS = {
@@ -151,15 +163,30 @@ class YFinanceLoader:
         std20 = df["close"].rolling(20, min_periods=1).std()
         df["bb_position"] = (df["close"] - sma20) / (2 * std20 + 1e-8)
 
+        # Add ARA/ARB features for Indonesian stocks
+        if is_indonesian_stock(self.symbol, source="yahoo"):
+            df = add_ara_arb_features(df, close_col="close", high_col="high", low_col="low")
+            print(f"  Added ARA/ARB features for Indonesian stock")
+
+            # Report limit hits
+            if "limit_hit" in df.columns:
+                limit_days = df["limit_hit"].sum()
+                if limit_days > 0:
+                    ara_days = df["ara_hit"].sum() if "ara_hit" in df.columns else 0
+                    arb_days = df["arb_hit"].sum() if "arb_hit" in df.columns else 0
+                    print(f"  Historical ARA/ARB hits: {int(ara_days)} ARA, {int(arb_days)} ARB")
+
         return df.fillna(0)
 
 
 class YFinanceForecaster:
     """Forecast using NeuralForecast models."""
 
-    def __init__(self, horizon: int = 5, interval: str = "1d"):
+    def __init__(self, horizon: int = 5, interval: str = "1d", symbol: str = ""):
         self.horizon = horizon
         self.interval = interval
+        self.symbol = symbol
+        self.is_indonesian = is_indonesian_stock(symbol, source="yahoo")
         self.nf = None
 
     def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
@@ -168,6 +195,14 @@ class YFinanceForecaster:
             "volatility", "returns", "price_vs_sma5", "price_vs_sma20",
             "vol_ratio", "momentum_5", "rsi", "macd", "bb_position"
         ]
+
+        # Add ARA/ARB features for Indonesian stocks
+        if self.is_indonesian:
+            exog_cols.extend([
+                "ara_proximity", "arb_proximity", "limit_range_pct",
+                "limit_bias", "pct_to_ara", "pct_to_arb"
+            ])
+
         available = [c for c in exog_cols if c in df.columns]
 
         nf_df = pd.DataFrame({
@@ -243,32 +278,56 @@ class YFinanceForecaster:
             forecasts["low"] = forecasts["ensemble"] - 1.96 * forecasts["std"]
             forecasts["high"] = forecasts["ensemble"] + 1.96 * forecasts["std"]
 
+        # Apply ARA/ARB clamping for Indonesian stocks
+        last_price = df["close"].iloc[-1]
+        if self.is_indonesian:
+            forecasts = clamp_forecast_series(forecasts, last_price, price_col="ensemble")
+
+            # Clamp low/high
+            if "low_clamped" in forecasts.columns:
+                forecasts["low"] = forecasts["low_clamped"]
+            if "high_clamped" in forecasts.columns:
+                forecasts["high"] = forecasts["high_clamped"]
+
+            print(f"\n  Forecasts clamped to ARA/ARB limits (Indonesian stock)")
+
         meta = {
             "horizon": self.horizon,
             "interval": self.interval,
             "input_size": input_size,
             "n_records": n,
+            "is_indonesian": self.is_indonesian,
+            "last_price": last_price,
         }
 
         return forecasts, nf_df, meta
 
 
-def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, currency: str):
-    """Print forecast results."""
+def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, currency: str, meta: dict = None):
+    """Print forecast results with ARA/ARB info for Indonesian stocks."""
     print(f"\n{'=' * 70}")
     print(f"FORECAST: {symbol}")
     print(f"{'=' * 70}")
 
-    cols = [c for c in forecasts.columns if c not in ["unique_id", "std"]]
+    # Show ARA/ARB limits for Indonesian stocks
+    is_indonesian = meta.get("is_indonesian", False) if meta else symbol.endswith(".JK")
+    if is_indonesian:
+        limit_info = get_daily_limit_info(last_price)
+        print(f"\nARA/ARB Limits (Day 1 based on {last_price:,.0f} IDR):")
+        print(f"  ARA (Upper): {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)")
+        print(f"  ARB (Lower): {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)")
+
+    # Determine columns to show
+    show_clamped = "ensemble_clamped" in forecasts.columns
 
     # Header
     print(f"\n{'Date':<12}", end="")
-    for c in cols:
-        if c == "ds":
-            continue
-        print(f"{c[:8]:>12}", end="")
-    print()
-    print("-" * (12 + 12 * (len(cols) - 1)))
+    if show_clamped:
+        print(f"{'Forecast':>12}{'Clamped':>12}{'ARA':>10}{'ARB':>10}", end="")
+    else:
+        print(f"{'Forecast':>12}{'Low':>12}{'High':>12}", end="")
+    print(f"{'Change':>10}")
+    print("-" * (12 + (44 if show_clamped else 46)))
 
     # Data
     for _, row in forecasts.iterrows():
@@ -278,29 +337,45 @@ def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, curre
         else:
             date_str = str(d)[:10]
         print(f"{date_str:<12}", end="")
-        for c in cols:
-            if c == "ds":
-                continue
-            print(f"{row[c]:>12,.2f}", end="")
-        print()
+
+        if show_clamped:
+            ens = row.get("ensemble", 0)
+            clamped = row.get("ensemble_clamped", ens)
+            ara = row.get("ara_limit", 0)
+            arb = row.get("arb_limit", 0)
+            pct = (clamped / last_price - 1) * 100
+            print(f"{ens:>12,.0f}{clamped:>12,.0f}{ara:>10,.0f}{arb:>10,.0f}{pct:>+9.2f}%")
+        else:
+            ens = row.get("ensemble", 0)
+            low = row.get("low", 0)
+            high = row.get("high", 0)
+            pct = (ens / last_price - 1) * 100
+            print(f"{ens:>12,.2f}{low:>12,.2f}{high:>12,.2f}{pct:>+9.2f}%")
 
     # Summary
     if "ensemble" in forecasts.columns:
         print(f"\n{'=' * 70}")
         print(f"SUMMARY ({currency})")
         print(f"{'=' * 70}")
-        print(f"  Current price:   {last_price:>14,.2f}")
-        print(f"  Forecast avg:    {forecasts['ensemble'].mean():>14,.2f} ({(forecasts['ensemble'].mean()/last_price-1)*100:+.2f}%)")
-        print(f"  Forecast high:   {forecasts['ensemble'].max():>14,.2f} ({(forecasts['ensemble'].max()/last_price-1)*100:+.2f}%)")
-        print(f"  Forecast low:    {forecasts['ensemble'].min():>14,.2f} ({(forecasts['ensemble'].min()/last_price-1)*100:+.2f}%)")
-        print(f"  Final forecast:  {forecasts['ensemble'].iloc[-1]:>14,.2f} ({(forecasts['ensemble'].iloc[-1]/last_price-1)*100:+.2f}%)")
+        print(f"  Current price:   {last_price:>14,.0f}")
+
+        if show_clamped:
+            print(f"\n  Clamped to ARA/ARB limits:")
+            fc = forecasts["ensemble_clamped"]
+        else:
+            fc = forecasts["ensemble"]
+
+        print(f"  Forecast avg:    {fc.mean():>14,.0f} ({(fc.mean()/last_price-1)*100:+.2f}%)")
+        print(f"  Forecast high:   {fc.max():>14,.0f} ({(fc.max()/last_price-1)*100:+.2f}%)")
+        print(f"  Forecast low:    {fc.min():>14,.0f} ({(fc.min()/last_price-1)*100:+.2f}%)")
+        print(f"  Final forecast:  {fc.iloc[-1]:>14,.0f} ({(fc.iloc[-1]/last_price-1)*100:+.2f}%)")
 
         if "std" in forecasts.columns:
             avg_std = forecasts["std"].mean()
-            print(f"  Uncertainty:     {avg_std:>14,.2f} (+/- {avg_std/last_price*100:.2f}%)")
+            print(f"  Uncertainty:     {avg_std:>14,.0f} (+/- {avg_std/last_price*100:.2f}%)")
 
         # Direction
-        final = forecasts["ensemble"].iloc[-1]
+        final = fc.iloc[-1]
         pct_change = (final / last_price - 1) * 100
         if pct_change > 2:
             outlook = "BULLISH"
@@ -331,10 +406,21 @@ def plot_forecast(df: pd.DataFrame, forecasts: pd.DataFrame, symbol: str, name: 
             ax1.plot(forecasts["ds"], forecasts[col], "--", alpha=0.4, linewidth=1, label=col)
 
         if "ensemble" in forecasts.columns:
-            ax1.plot(forecasts["ds"], forecasts["ensemble"], "r-", linewidth=2, label="Ensemble")
+            # Plot clamped forecast if available
+            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
+            ax1.plot(forecasts["ds"], forecasts[price_col], "r-", linewidth=2,
+                     label="Forecast (Clamped)" if "ensemble_clamped" in forecasts.columns else "Ensemble")
             if "low" in forecasts.columns:
                 ax1.fill_between(forecasts["ds"], forecasts["low"], forecasts["high"],
                                  alpha=0.2, color="red", label="95% CI")
+
+            # Plot ARA/ARB limits for Indonesian stocks
+            if "ara_limit" in forecasts.columns:
+                ax1.plot(forecasts["ds"], forecasts["ara_limit"], "g--", alpha=0.7,
+                         linewidth=1.5, label="ARA (Upper Limit)")
+            if "arb_limit" in forecasts.columns:
+                ax1.plot(forecasts["ds"], forecasts["arb_limit"], "m--", alpha=0.7,
+                         linewidth=1.5, label="ARB (Lower Limit)")
 
         # Moving averages
         if "sma_20" in df.columns:
@@ -370,10 +456,10 @@ def plot_forecast(df: pd.DataFrame, forecasts: pd.DataFrame, symbol: str, name: 
 
         plt.tight_layout()
 
-        from pathlib import Path
-        plot_dir = Path("plot")
-        plot_dir.mkdir(exist_ok=True)
-        out = plot_dir / f"yf_{symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        dir_name = symbol.replace(".JK", "")
+        plot_dir = Path("plot") / dir_name
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        out = plot_dir / f"yf_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(out, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {out}")
         plt.close()
@@ -454,22 +540,25 @@ Examples:
             print(f"Loaded {len(df)} records")
 
             # Forecast
-            forecaster = YFinanceForecaster(horizon=args.horizon, interval=args.interval)
+            forecaster = YFinanceForecaster(horizon=args.horizon, interval=args.interval, symbol=symbol)
             forecasts, historical, meta = forecaster.forecast(df)
 
             # Results
-            print_results(forecasts, df["close"].iloc[-1], symbol, currency)
+            print_results(forecasts, df["close"].iloc[-1], symbol, currency, meta)
 
             # Plot
             if not args.no_plot:
                 plot_forecast(df, forecasts, symbol, name)
 
             # Save
-            out = f"yf_{symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            dir_name = symbol.replace(".JK", "")
+            symbol_csv_dir = CSV_DIR / dir_name
+            symbol_csv_dir.mkdir(parents=True, exist_ok=True)
+            out = symbol_csv_dir / f"yf_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             forecasts.to_csv(out, index=False)
             print(f"\nSaved: {out}")
 
-            results.append({"symbol": symbol, "status": "success", "file": out})
+            results.append({"symbol": symbol, "status": "success", "file": str(out)})
 
         except Exception as e:
             print(f"\nError processing {symbol}: {e}")

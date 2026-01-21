@@ -8,3 +8,5 @@ lightning_logs/
 *.png
 subsectors.md
 **/__pycache__
+plot/
+csv/

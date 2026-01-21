@@ -23,6 +23,15 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# IDX ARA/ARB rules
+from idx_rules import (
+    add_ara_arb_features,
+    clamp_price_to_limit,
+    calculate_ara_arb,
+    get_daily_limit_info,
+)
+
 from neuralforecast import NeuralForecast
 from neuralforecast.models import LSTM, NBEATS, NHITS
 from neuralforecast.losses.pytorch import HuberLoss, DistributionLoss
@@ -32,6 +41,10 @@ warnings.filterwarnings("ignore")
 # Model persistence directory
 MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
+
+# CSV output directory
+CSV_DIR = Path("csv")
+CSV_DIR.mkdir(exist_ok=True)
 
 # Groups config file
 GROUPS_FILE = MODELS_DIR / "groups.json"
@@ -349,8 +362,8 @@ class SessionForecaster:
         """Calculate number of bars for given hours."""
         return int(hours * 60 / self.interval)
 
-    def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-        """Prepare NeuralForecast format with gap handling."""
+    def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], float]:
+        """Prepare NeuralForecast format with gap handling and ARA/ARB tracking."""
         exog_cols = [
             "volume",
             "volatility",
@@ -374,11 +387,45 @@ class SessionForecaster:
         for col in available:
             nf_df[col] = df[col].fillna(0)
 
+        # Get previous day's close for ARA/ARB calculation
+        # For intraday, we use the first bar's open as reference (previous close)
+        prev_close = df["open"].iloc[0] if "open" in df.columns else df["close"].iloc[0]
+        self.prev_close = prev_close  # Store for later use
+
+        # Calculate and store ARA/ARB limits
+        ara, arb = calculate_ara_arb(prev_close)
+        self.ara_limit = ara
+        self.arb_limit = arb
+
+        # Add ARA/ARB proximity features for each bar
+        if "close" in df.columns and "high" in df.columns and "low" in df.columns:
+            # Calculate proximity to limits
+            nf_df["ara_proximity"] = np.clip(
+                (df["high"] - prev_close) / (ara - prev_close + 1e-8), 0, 1
+            )
+            nf_df["arb_proximity"] = np.clip(
+                (prev_close - df["low"]) / (prev_close - arb + 1e-8), 0, 1
+            )
+            nf_df["pct_to_ara"] = (ara - df["close"]) / (df["close"] + 1e-8)
+            nf_df["pct_to_arb"] = (df["close"] - arb) / (df["close"] + 1e-8)
+
+            # Check if any bar hit ARA/ARB
+            nf_df["ara_hit"] = (df["high"] >= ara * 0.999).astype(int)
+            nf_df["arb_hit"] = (df["low"] <= arb * 1.001).astype(int)
+
+            available.extend(["ara_proximity", "arb_proximity", "pct_to_ara", "pct_to_arb"])
+
+            # Report hits
+            ara_hits = nf_df["ara_hit"].sum()
+            arb_hits = nf_df["arb_hit"].sum()
+            if ara_hits > 0 or arb_hits > 0:
+                print(f"  ARA/ARB hits detected: {int(ara_hits)} ARA, {int(arb_hits)} ARB")
+
         # Handle gaps in intraday time series
         nf_df = self._fill_intraday_gaps(nf_df)
 
         nf_df = nf_df.replace([np.inf, -np.inf], 0).fillna(0)
-        return nf_df, available
+        return nf_df, available, prev_close
 
     def _fill_intraday_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
         """Fill gaps in intraday time series and add available_mask column."""
@@ -432,7 +479,7 @@ class SessionForecaster:
         self, df: pd.DataFrame, hours: float, target_session: str = None, force_retrain: bool = False
     ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
         """Train and forecast for specified hours. Supports incremental training."""
-        nf_df, exog = self.prepare_data(df)
+        nf_df, exog, prev_close = self.prepare_data(df)
         n = len(nf_df)
 
         horizon = self.calculate_horizon(hours)
@@ -446,6 +493,11 @@ class SessionForecaster:
         )
         print(f"  Price range: {nf_df['y'].min():,.2f} - {nf_df['y'].max():,.2f}")
         print(f"  Last price: {nf_df['y'].iloc[-1]:,.2f}")
+
+        # Show ARA/ARB limits
+        print(f"\n  ARA/ARB Limits (based on prev close {prev_close:,.0f}):")
+        print(f"    ARA (Upper): {self.ara_limit:,.0f} (+{(self.ara_limit/prev_close-1)*100:.1f}%)")
+        print(f"    ARB (Lower): {self.arb_limit:,.0f} (-{(1-self.arb_limit/prev_close)*100:.1f}%)")
 
         print(f"\n{'=' * 60}")
         print("FORECAST CONFIG")
@@ -626,6 +678,17 @@ class SessionForecaster:
             forecasts["low"] = forecasts["ensemble"] - 1.96 * forecasts["std"]
             forecasts["high"] = forecasts["ensemble"] + 1.96 * forecasts["std"]
 
+            # Clamp forecasts to ARA/ARB limits (for intraday, same limits apply all day)
+            forecasts["ensemble_clamped"] = forecasts["ensemble"].clip(
+                lower=self.arb_limit, upper=self.ara_limit
+            )
+            forecasts["low"] = forecasts["low"].clip(lower=self.arb_limit)
+            forecasts["high"] = forecasts["high"].clip(upper=self.ara_limit)
+            forecasts["ara_limit"] = self.ara_limit
+            forecasts["arb_limit"] = self.arb_limit
+
+            print(f"\n  Forecasts clamped to ARA/ARB: {self.arb_limit:,.0f} - {self.ara_limit:,.0f}")
+
         meta = {
             "horizon": horizon,
             "hours": hours,
@@ -633,13 +696,16 @@ class SessionForecaster:
             "target_session": target_session,
             "forecast_start": start_dt,
             "forecast_end": future_times[-1] if future_times else start_dt,
+            "ara_limit": self.ara_limit,
+            "arb_limit": self.arb_limit,
+            "prev_close": self.prev_close,
         }
 
         return forecasts, nf_df, meta
 
 
 def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, meta: dict):
-    """Print forecast results."""
+    """Print forecast results with ARA/ARB limits."""
     print(f"\n{'=' * 70}")
     print(f"FORECAST: {symbol}")
     if meta.get("target_session"):
@@ -650,17 +716,28 @@ def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, meta:
     print(
         f"Period: {meta['forecast_start'].strftime('%Y-%m-%d %H:%M')} to {meta['forecast_end'].strftime('%H:%M')}"
     )
+
+    # Show ARA/ARB limits
+    if "ara_limit" in meta:
+        prev_close = meta.get("prev_close", last_price)
+        print(f"\nARA/ARB Limits (based on prev close {prev_close:,.0f}):")
+        print(f"  ARA: {meta['ara_limit']:,.0f} (+{(meta['ara_limit']/prev_close-1)*100:.1f}%)")
+        print(f"  ARB: {meta['arb_limit']:,.0f} (-{(1-meta['arb_limit']/prev_close)*100:.1f}%)")
+
     print(f"{'=' * 70}")
 
     # Show summary at key intervals
-    cols = ["ds", "ensemble", "low", "high"]
-    cols = [c for c in cols if c in forecasts.columns]
+    show_clamped = "ensemble_clamped" in forecasts.columns
 
     # Show every 15 minutes or so
     step = max(1, len(forecasts) // 12)
 
-    print(f"\n{'Time':<10} {'Forecast':>12} {'Low':>12} {'High':>12} {'Change':>10}")
-    print("-" * 58)
+    if show_clamped:
+        print(f"\n{'Time':<10} {'Forecast':>12} {'Clamped':>12} {'Low':>10} {'High':>10} {'Change':>10}")
+        print("-" * 66)
+    else:
+        print(f"\n{'Time':<10} {'Forecast':>12} {'Low':>12} {'High':>12} {'Change':>10}")
+        print("-" * 58)
 
     indices = list(range(0, len(forecasts), step))
     if len(forecasts) - 1 not in indices:
@@ -676,33 +753,47 @@ def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, meta:
         ens = row.get("ensemble", row.get("NBEATS", 0))
         low = row.get("low", ens)
         high = row.get("high", ens)
-        pct = (ens / last_price - 1) * 100
-        print(f"{t:<10} {ens:>12,.2f} {low:>12,.2f} {high:>12,.2f} {pct:>+9.2f}%")
+
+        if show_clamped:
+            clamped = row.get("ensemble_clamped", ens)
+            pct = (clamped / last_price - 1) * 100
+            print(f"{t:<10} {ens:>12,.0f} {clamped:>12,.0f} {low:>10,.0f} {high:>10,.0f} {pct:>+9.2f}%")
+        else:
+            pct = (ens / last_price - 1) * 100
+            print(f"{t:<10} {ens:>12,.0f} {low:>12,.0f} {high:>12,.0f} {pct:>+9.2f}%")
 
     # Summary
     if "ensemble" in forecasts.columns:
         print(f"\n{'=' * 70}")
         print("SUMMARY")
         print(f"{'=' * 70}")
-        print(f"  Last close:      {last_price:>14,.2f}")
+        print(f"  Last close:      {last_price:>14,.0f}")
+
+        # Use clamped values if available
+        price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
+        fc = forecasts[price_col]
+
+        if "ensemble_clamped" in forecasts.columns:
+            print(f"\n  Clamped to ARA/ARB limits:")
+
         print(
-            f"  Open forecast:   {forecasts['ensemble'].iloc[0]:>14,.2f} ({(forecasts['ensemble'].iloc[0] / last_price - 1) * 100:+.2f}%)"
+            f"  Open forecast:   {fc.iloc[0]:>14,.0f} ({(fc.iloc[0] / last_price - 1) * 100:+.2f}%)"
         )
         print(
-            f"  High forecast:   {forecasts['ensemble'].max():>14,.2f} ({(forecasts['ensemble'].max() / last_price - 1) * 100:+.2f}%)"
+            f"  High forecast:   {fc.max():>14,.0f} ({(fc.max() / last_price - 1) * 100:+.2f}%)"
         )
         print(
-            f"  Low forecast:    {forecasts['ensemble'].min():>14,.2f} ({(forecasts['ensemble'].min() / last_price - 1) * 100:+.2f}%)"
+            f"  Low forecast:    {fc.min():>14,.0f} ({(fc.min() / last_price - 1) * 100:+.2f}%)"
         )
         print(
-            f"  Close forecast:  {forecasts['ensemble'].iloc[-1]:>14,.2f} ({(forecasts['ensemble'].iloc[-1] / last_price - 1) * 100:+.2f}%)"
+            f"  Close forecast:  {fc.iloc[-1]:>14,.0f} ({(fc.iloc[-1] / last_price - 1) * 100:+.2f}%)"
         )
 
         direction = (
             "BULLISH"
-            if forecasts["ensemble"].iloc[-1] > last_price
+            if fc.iloc[-1] > last_price
             else "BEARISH"
-            if forecasts["ensemble"].iloc[-1] < last_price
+            if fc.iloc[-1] < last_price
             else "NEUTRAL"
         )
         print(f"\n  Outlook: {direction}")
@@ -740,12 +831,14 @@ def plot_forecast(
             )
 
         if "ensemble" in forecasts.columns:
+            # Plot clamped forecast if available
+            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
             ax1.plot(
                 forecasts["ds"],
-                forecasts["ensemble"],
+                forecasts[price_col],
                 "r-",
                 linewidth=2,
-                label="Ensemble Forecast",
+                label="Forecast (Clamped)" if "ensemble_clamped" in forecasts.columns else "Ensemble Forecast",
             )
             if "low" in forecasts.columns:
                 ax1.fill_between(
@@ -755,6 +848,26 @@ def plot_forecast(
                     alpha=0.2,
                     color="red",
                     label="95% CI",
+                )
+
+            # Plot ARA/ARB limits
+            if "ara_limit" in forecasts.columns:
+                ax1.axhline(
+                    y=forecasts["ara_limit"].iloc[0],
+                    color="green",
+                    linestyle="--",
+                    alpha=0.7,
+                    linewidth=1.5,
+                    label=f"ARA ({forecasts['ara_limit'].iloc[0]:,.0f})",
+                )
+            if "arb_limit" in forecasts.columns:
+                ax1.axhline(
+                    y=forecasts["arb_limit"].iloc[0],
+                    color="magenta",
+                    linestyle="--",
+                    alpha=0.7,
+                    linewidth=1.5,
+                    label=f"ARB ({forecasts['arb_limit'].iloc[0]:,.0f})",
                 )
 
         # Add vertical line at forecast start
@@ -801,9 +914,9 @@ def plot_forecast(
 
         plt.tight_layout()
 
-        plot_dir = Path("plot")
-        plot_dir.mkdir(exist_ok=True)
-        out = plot_dir / f"short_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        plot_dir = Path("plot") / symbol
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        out = plot_dir / f"short_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(out, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {out}")
         plt.close()
@@ -976,7 +1089,9 @@ Examples:
             plot_data = symbol_data if group_name and not symbol_data.empty else ohlcv
             plot_forecast(plot_data, forecasts, symbol, meta)
 
-        out = f"short_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        symbol_csv_dir = CSV_DIR / symbol
+        symbol_csv_dir.mkdir(parents=True, exist_ok=True)
+        out = symbol_csv_dir / f"short_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         forecasts.to_csv(out, index=False)
         print(f"\nSaved: {out}")
 
