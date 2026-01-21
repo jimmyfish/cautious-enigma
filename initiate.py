@@ -603,6 +603,44 @@ def cleanup_source_files(session_dir: Path) -> int:
 # =============================================================================
 
 
+def check_market_holiday(session: requests.Session, sample_symbol: str = "BBCA") -> Tuple[bool, Optional[str]]:
+    """Check if today is a market holiday by comparing latest price data date with today.
+
+    Returns: (is_holiday: bool, last_trading_date: Optional[str])
+    """
+    today = date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    # Request data from past 7 days to ensure we get the last trading date
+    from_date = today - timedelta(days=7)
+    from_str = from_date.strftime("%Y-%m-%d")
+
+    url = (
+        f"https://exodus.stockbit.com/company-price-feed/historical/summary/{sample_symbol}"
+        f"?period=HS_PERIOD_DAILY&start_date={from_str}&end_date={today_str}&limit=5&page=1"
+    )
+
+    try:
+        res = session.get(url, timeout=30)
+        res.raise_for_status()
+        data = res.json()
+
+        history = data.get("data", {}).get("result", [])
+        if not history:
+            return True, None
+
+        latest_date = history[0].get("date")
+        if not latest_date:
+            return True, None
+
+        # If latest data date is not today, it's a holiday
+        is_holiday = latest_date != today_str
+        return is_holiday, latest_date
+
+    except Exception as e:
+        log(f"{Fore.YELLOW}Warning: Could not check market holiday: {e}{Style.RESET_ALL}")
+        return False, None  # Proceed if we can't check
+
+
 def normalize_auth(token):
     if not token:
         return None
@@ -914,6 +952,22 @@ Examples:
     })
 
     total = len(symbols)
+
+    # Check for market holiday before processing
+    is_holiday, last_trading_date = check_market_holiday(session)
+    if is_holiday:
+        today_str = date.today().strftime("%Y-%m-%d")
+        holiday_msg = (
+            f"<b>Market Holiday</b>\n"
+            f"Today: {today_str}\n"
+            f"Last trading date: {last_trading_date or 'unknown'}\n"
+            f"Initiate process skipped."
+        )
+        log(f"{Fore.YELLOW}Market holiday detected. Last trading date: {last_trading_date}{Style.RESET_ALL}")
+        log(f"{Fore.YELLOW}Skipping initiate process.{Style.RESET_ALL}")
+        send_telegram(holiday_msg)
+        sys.exit(0)
+
     total_retries = 0
     total_failed = 0
     processed = 0

@@ -21,6 +21,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# IDX ARA/ARB rules
+from idx_rules import (
+    add_ara_arb_features,
+    adjust_mask_for_limit_hits,
+    clamp_forecast_series,
+    get_daily_limit_info,
+)
+
 # NeuralForecast imports
 from neuralforecast import NeuralForecast
 from neuralforecast.models import LSTM, NBEATS, NHITS, TFT
@@ -31,6 +39,10 @@ warnings.filterwarnings("ignore")
 # Model persistence directory
 MODELS_DIR = Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
+
+# CSV output directory
+CSV_DIR = Path("csv")
+CSV_DIR.mkdir(exist_ok=True)
 
 # Groups config file
 GROUPS_FILE = MODELS_DIR / "groups.json"
@@ -475,9 +487,13 @@ class StockForecaster:
         return models
 
     def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-        """Prepare data in NeuralForecast format with alpha features and gap handling."""
+        """Prepare data in NeuralForecast format with alpha features, ARA/ARB features, and gap handling."""
+
+        # Add ARA/ARB features to source data
+        df_with_limits = self._add_ara_arb_features(df)
 
         # Define exogenous features for TFT attention
+        # Now includes ARA/ARB proximity features
         exog_features = [
             "obi",
             "concentration_diff",
@@ -485,28 +501,88 @@ class StockForecaster:
             "volatility",
             "accdist",
             "pct_change",
+            # ARA/ARB features
+            "ara_proximity",
+            "arb_proximity",
+            "limit_range_pct",
+            "limit_bias",
+            "pct_to_ara",
+            "pct_to_arb",
         ]
 
         # Filter to available features
-        available_exog = [c for c in exog_features if c in df.columns]
+        available_exog = [c for c in exog_features if c in df_with_limits.columns]
 
         # Build NeuralForecast dataframe
         nf_df = pd.DataFrame(
-            {"unique_id": df["unique_id"], "ds": df["ds"], "y": df["y"]}
+            {"unique_id": df_with_limits["unique_id"], "ds": df_with_limits["ds"], "y": df_with_limits["y"]}
         )
 
         # Add exogenous features
         for col in available_exog:
-            nf_df[col] = df[col].fillna(0)
+            nf_df[col] = df_with_limits[col].fillna(0)
+
+        # Add limit hit flags for mask adjustment
+        if "limit_hit" in df_with_limits.columns:
+            nf_df["limit_hit"] = df_with_limits["limit_hit"].fillna(0)
+        if "ara_hit" in df_with_limits.columns:
+            nf_df["ara_hit"] = df_with_limits["ara_hit"].fillna(0)
+        if "arb_hit" in df_with_limits.columns:
+            nf_df["arb_hit"] = df_with_limits["arb_hit"].fillna(0)
 
         # Handle gaps in time series by adding available_mask
         # This tells NeuralForecast which rows have real data vs filled gaps
         nf_df = self._fill_gaps_with_mask(nf_df)
 
+        # Adjust mask to down-weight days that hit ARA/ARB limits
+        # These days have distorted price signals
+        nf_df = adjust_mask_for_limit_hits(nf_df, penalty=0.5)
+
         # Clean data
         nf_df = nf_df.replace([np.inf, -np.inf], 0).fillna(0)
 
+        # Report ARA/ARB statistics
+        if "limit_hit" in nf_df.columns:
+            limit_days = nf_df["limit_hit"].sum()
+            if limit_days > 0:
+                print(f"  ARA/ARB limit days detected: {int(limit_days)} ({limit_days/len(nf_df)*100:.1f}%)")
+
         return nf_df, available_exog
+
+    def _add_ara_arb_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add ARA/ARB features for each symbol in the dataframe."""
+        result_dfs = []
+
+        for uid in df["unique_id"].unique():
+            uid_df = df[df["unique_id"] == uid].copy()
+            uid_df = uid_df.sort_values("ds")
+
+            # Need OHLC columns for ARA/ARB calculation
+            if all(c in uid_df.columns for c in ["close", "high", "low"]):
+                uid_df = add_ara_arb_features(
+                    uid_df,
+                    close_col="close",
+                    high_col="high",
+                    low_col="low"
+                )
+            elif "y" in uid_df.columns:
+                # Fallback: use y as close, estimate high/low
+                uid_df["_close"] = uid_df["y"]
+                uid_df["_high"] = uid_df["y"]
+                uid_df["_low"] = uid_df["y"]
+                uid_df = add_ara_arb_features(
+                    uid_df,
+                    close_col="_close",
+                    high_col="_high",
+                    low_col="_low"
+                )
+                uid_df = uid_df.drop(columns=["_close", "_high", "_low"], errors="ignore")
+
+            result_dfs.append(uid_df)
+
+        if result_dfs:
+            return pd.concat(result_dfs, ignore_index=True)
+        return df
 
     def _fill_gaps_with_mask(self, df: pd.DataFrame) -> pd.DataFrame:
         """Fill gaps in time series and add available_mask column."""
@@ -699,8 +775,8 @@ class StockForecaster:
 
         return forecasts, nf_df
 
-    def ensemble_forecast(self, forecasts: pd.DataFrame) -> pd.DataFrame:
-        """Create ensemble from all models."""
+    def ensemble_forecast(self, forecasts: pd.DataFrame, last_price: float) -> pd.DataFrame:
+        """Create ensemble from all models and apply ARA/ARB clamping."""
         model_cols = [c for c in forecasts.columns if c not in ["ds", "unique_id"]]
 
         if model_cols:
@@ -713,61 +789,107 @@ class StockForecaster:
                 forecasts["ensemble"] + 1.96 * forecasts["ensemble_std"]
             )
 
+            # Apply ARA/ARB clamping to forecasts
+            # This ensures predictions don't exceed daily price limits
+            forecasts = clamp_forecast_series(
+                forecasts,
+                last_price,
+                price_col="ensemble"
+            )
+
+            # Also clamp low/high to ARA/ARB
+            if "low_clamped" in forecasts.columns:
+                forecasts["ensemble_low"] = forecasts["low_clamped"]
+            if "high_clamped" in forecasts.columns:
+                forecasts["ensemble_high"] = forecasts["high_clamped"]
+
+            print(f"\n  Forecasts clamped to ARA/ARB limits (based on {last_price:,.0f} IDR)")
+
         return forecasts
 
 
 def print_forecast_table(forecasts: pd.DataFrame, symbol: str, last_price: float):
-    """Print formatted forecast results."""
-    print(f"\n{'=' * 70}")
+    """Print formatted forecast results with ARA/ARB limits."""
+    print(f"\n{'=' * 80}")
     print(f"FORECAST RESULTS: {symbol}")
-    print(f"{'=' * 70}")
+    print(f"{'=' * 80}")
 
-    model_cols = [
-        c
-        for c in forecasts.columns
-        if c not in ["ds", "unique_id", "ensemble_std", "ensemble_low", "ensemble_high"]
-    ]
+    # Show ARA/ARB limits for first day
+    limit_info = get_daily_limit_info(last_price)
+    print(f"\nARA/ARB Limits (Day 1 based on {last_price:,.0f} IDR):")
+    print(f"  ARA (Upper): {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)")
+    print(f"  ARB (Lower): {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)")
+
+    # Determine which columns to show
+    show_clamped = "ensemble_clamped" in forecasts.columns
+    has_limits = "ara_limit" in forecasts.columns
 
     # Header
-    print(f"\n{'Date':<14}", end="")
-    for col in model_cols:
-        print(f"{col[:10]:>12}", end="")
-    print()
-    print("-" * (14 + 12 * len(model_cols)))
+    print(f"\n{'Date':<12}", end="")
+    if show_clamped:
+        print(f"{'Forecast':>12}{'Clamped':>12}", end="")
+        if has_limits:
+            print(f"{'ARA':>10}{'ARB':>10}", end="")
+    else:
+        print(f"{'Forecast':>12}", end="")
+    print(f"{'Change':>10}")
+    print("-" * (12 + (44 if show_clamped and has_limits else 22 if show_clamped else 22)))
 
-    # Data
+    # Data - use clamped values if available
+    price_col = "ensemble_clamped" if show_clamped else "ensemble"
     for _, row in forecasts.iterrows():
         date_str = (
             row["ds"].strftime("%Y-%m-%d")
             if hasattr(row["ds"], "strftime")
             else str(row["ds"])[:10]
         )
-        print(f"{date_str:<14}", end="")
-        for col in model_cols:
-            print(f"{row[col]:>12,.2f}", end="")
-        print()
+        print(f"{date_str:<12}", end="")
+
+        if show_clamped:
+            orig = row.get("ensemble", 0)
+            clamped = row.get("ensemble_clamped", orig)
+            print(f"{orig:>12,.0f}{clamped:>12,.0f}", end="")
+            if has_limits:
+                ara = row.get("ara_limit", 0)
+                arb = row.get("arb_limit", 0)
+                print(f"{ara:>10,.0f}{arb:>10,.0f}", end="")
+            pct = (clamped / last_price - 1) * 100
+        else:
+            val = row.get("ensemble", 0)
+            print(f"{val:>12,.0f}", end="")
+            pct = (val / last_price - 1) * 100
+
+        print(f"{pct:>+9.2f}%")
 
     # Summary
     if "ensemble" in forecasts.columns:
-        print(f"\n{'=' * 70}")
+        print(f"\n{'=' * 80}")
         print("SUMMARY")
-        print(f"{'=' * 70}")
-        print(f"  Last price:      {last_price:>14,.2f}")
-        print(f"  Forecast mean:   {forecasts['ensemble'].mean():>14,.2f}")
-        print(
-            f"  Forecast range:  {forecasts['ensemble'].min():>14,.2f} - {forecasts['ensemble'].max():,.2f}"
-        )
+        print(f"{'=' * 80}")
+        print(f"  Last price:      {last_price:>14,.0f}")
 
-        final_forecast = forecasts["ensemble"].iloc[-1]
+        if show_clamped:
+            print(f"\n  Original (unclamped):")
+            print(f"    Forecast mean:   {forecasts['ensemble'].mean():>12,.0f}")
+            print(f"    Forecast range:  {forecasts['ensemble'].min():>12,.0f} - {forecasts['ensemble'].max():,.0f}")
+
+            print(f"\n  Clamped (within ARA/ARB):")
+            print(f"    Forecast mean:   {forecasts['ensemble_clamped'].mean():>12,.0f}")
+            print(f"    Forecast range:  {forecasts['ensemble_clamped'].min():>12,.0f} - {forecasts['ensemble_clamped'].max():,.0f}")
+
+            final_forecast = forecasts["ensemble_clamped"].iloc[-1]
+        else:
+            print(f"  Forecast mean:   {forecasts['ensemble'].mean():>14,.0f}")
+            print(f"  Forecast range:  {forecasts['ensemble'].min():>14,.0f} - {forecasts['ensemble'].max():,.0f}")
+            final_forecast = forecasts["ensemble"].iloc[-1]
+
         pct = (final_forecast / last_price - 1) * 100
         direction = "UP" if pct > 0 else "DOWN" if pct < 0 else "FLAT"
-        print(f"  Expected move:   {pct:>+13.2f}% ({direction})")
+        print(f"\n  Expected move:   {pct:>+13.2f}% ({direction})")
 
         if "ensemble_std" in forecasts.columns:
             avg_std = forecasts["ensemble_std"].mean()
-            print(
-                f"  Uncertainty:     {avg_std:>14,.2f} (+/- {avg_std / last_price * 100:.2f}%)"
-            )
+            print(f"  Uncertainty:     {avg_std:>14,.0f} (+/- {avg_std / last_price * 100:.2f}%)")
 
 
 def plot_results(
@@ -813,11 +935,13 @@ def plot_results(
             ax1.plot(forecasts["ds"], forecasts[col], "--", label=col, alpha=0.6)
 
         if "ensemble" in forecasts.columns:
+            # Plot clamped forecast if available, otherwise original
+            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
             ax1.plot(
                 forecasts["ds"],
-                forecasts["ensemble"],
+                forecasts[price_col],
                 "r-o",
-                label="Ensemble",
+                label="Ensemble (Clamped)" if "ensemble_clamped" in forecasts.columns else "Ensemble",
                 linewidth=2,
                 markersize=6,
             )
@@ -829,6 +953,26 @@ def plot_results(
                     alpha=0.2,
                     color="red",
                     label="95% CI",
+                )
+
+            # Plot ARA/ARB limits if available
+            if "ara_limit" in forecasts.columns:
+                ax1.plot(
+                    forecasts["ds"],
+                    forecasts["ara_limit"],
+                    "g--",
+                    alpha=0.7,
+                    linewidth=1,
+                    label="ARA (Upper Limit)",
+                )
+            if "arb_limit" in forecasts.columns:
+                ax1.plot(
+                    forecasts["ds"],
+                    forecasts["arb_limit"],
+                    "m--",
+                    alpha=0.7,
+                    linewidth=1,
+                    label="ARB (Lower Limit)",
                 )
 
         ax1.set_title(
@@ -880,9 +1024,9 @@ def plot_results(
 
         plt.tight_layout()
 
-        plot_dir = Path("plot")
-        plot_dir.mkdir(exist_ok=True)
-        output_path = plot_dir / f"forecast_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        plot_dir = Path("plot") / symbol
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        output_path = plot_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {output_path}")
         plt.close()
@@ -929,19 +1073,23 @@ Examples:
         if not groups:
             print("No groups defined. Create models/groups.json to define groups.")
         else:
+            RED = "\033[31m"
+            RESET = "\033[0m"
+            available_symbols = engine.get_available_symbols()
             print("Available groups (edit models/groups.json to modify):")
             for name, symbols in groups.items():
-                available = [s for s in symbols if s in engine.get_available_symbols()]
-                print(f"  {name}: {', '.join(symbols)}")
-                if available:
-                    print(f"    (available in sources: {', '.join(available)})")
+                colored = [
+                    s if s in available_symbols else f"{RED}{s}{RESET}"
+                    for s in symbols
+                ]
+                print(f"  {name}: {', '.join(colored)}")
         return
 
     if args.list:
         symbols = engine.get_available_symbols()
         print("Available symbols:")
         for s in sorted(symbols):
-            sessions = len(list((engine.base_path / s).iterdir()))
+            sessions = len([d for d in (engine.base_path / s).iterdir() if d.is_dir()])
             group = find_group_for_symbol(s, groups)
             group_str = f" [{group}]" if group else ""
             print(f"  {s}: {sessions} session(s){group_str}")
@@ -1001,7 +1149,7 @@ Examples:
 
         forecaster = StockForecaster(horizon=args.horizon, symbol=symbol, group=group_name)
         forecasts, historical = forecaster.train_and_forecast(df, force_retrain=args.retrain)
-        forecasts = forecaster.ensemble_forecast(forecasts)
+        forecasts = forecaster.ensemble_forecast(forecasts, last_price)
 
         print_forecast_table(forecasts, symbol, last_price)
 
@@ -1010,9 +1158,9 @@ Examples:
             plot_data = symbol_data if group_name and not symbol_data.empty else df
             plot_results(historical, forecasts, symbol, plot_data)
 
-        output_file = (
-            f"forecast_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
+        symbol_csv_dir = CSV_DIR / symbol
+        symbol_csv_dir.mkdir(parents=True, exist_ok=True)
+        output_file = symbol_csv_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         forecasts.to_csv(output_file, index=False)
         print(f"\nSaved: {output_file}")
 
