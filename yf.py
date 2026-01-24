@@ -35,6 +35,15 @@ from idx_rules import (
     get_daily_limit_info,
     is_indonesian_stock,
 )
+
+# Watchlist integration
+from watchlist import (
+    add_watchlist_args,
+    validate_watchlist_args,
+    update_watchlist,
+    print_watchlist_summary,
+    filter_symbols_by_outlook,
+)
 from neuralforecast import NeuralForecast
 from neuralforecast.models import NBEATS, NHITS, LSTM
 
@@ -498,7 +507,18 @@ Examples:
     parser.add_argument("--period", "-P", default="3mo", help="History period (default: 3mo)")
     parser.add_argument("--no-plot", action="store_true", help="Disable chart generation")
 
+    # Add watchlist arguments
+    add_watchlist_args(parser)
+
     args = parser.parse_args()
+
+    # Validate watchlist arguments
+    if hasattr(args, 'watchlist') and args.watchlist:
+        try:
+            validate_watchlist_args(args)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
 
     if not args.symbol:
         parser.print_help()
@@ -518,6 +538,8 @@ Examples:
 
     results = []
     errors = []
+    skipped = []
+    forecast_summaries = []  # Collect summaries for final table
 
     for i, symbol in enumerate(symbols, 1):
         print(f"\n{'#' * 70}")
@@ -535,6 +557,14 @@ Examples:
             print(f"Currency: {currency}")
 
             df = loader.load_data(period=args.period, interval=args.interval)
+
+            # Check if price ever touches 50 or below - skip if so
+            min_price = df["close"].min()
+            if min_price <= 50:
+                print(f"\n  SKIPPING {symbol}: Price touched {min_price:.2f} (threshold: 50)")
+                skipped.append({"symbol": symbol, "reason": f"Price touched {min_price:.2f}"})
+                continue
+
             df = loader.add_features(df)
 
             print(f"Loaded {len(df)} records")
@@ -560,6 +590,29 @@ Examples:
 
             results.append({"symbol": symbol, "status": "success", "file": str(out)})
 
+            # Collect forecast summary for final table
+            last_price = df["close"].iloc[-1]
+            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
+            if price_col in forecasts.columns:
+                fc = forecasts[price_col]
+                final_forecast = fc.iloc[-1]
+                pct_change = (final_forecast / last_price - 1) * 100
+                if pct_change > 2:
+                    outlook = "BULLISH"
+                elif pct_change < -2:
+                    outlook = "BEARISH"
+                else:
+                    outlook = "NEUTRAL"
+                forecast_summaries.append({
+                    "symbol": symbol,
+                    "name": name[:20],  # Truncate long names
+                    "currency": currency,
+                    "current": last_price,
+                    "forecast": final_forecast,
+                    "change_pct": pct_change,
+                    "outlook": outlook,
+                })
+
         except Exception as e:
             print(f"\nError processing {symbol}: {e}")
             import traceback
@@ -568,12 +621,29 @@ Examples:
 
     # Summary for multiple symbols
     if len(symbols) > 1:
-        print(f"\n{'=' * 70}")
+        print(f"\n{'=' * 100}")
         print(f"BATCH SUMMARY")
-        print(f"{'=' * 70}")
+        print(f"{'=' * 100}")
         print(f"  Total: {len(symbols)}")
         print(f"  Success: {len(results)}")
+        print(f"  Skipped: {len(skipped)}")
         print(f"  Failed: {len(errors)}")
+
+        # Unified forecast table
+        if forecast_summaries:
+            print(f"\n{'=' * 100}")
+            print(f"FORECAST SUMMARY TABLE")
+            print(f"{'=' * 100}")
+            print(f"{'Symbol':<12}{'Name':<22}{'Currency':<10}{'Current':>14}{'Forecast':>14}{'Change':>10}{'Outlook':<10}")
+            print("-" * 100)
+            for s in forecast_summaries:
+                print(f"{s['symbol']:<12}{s['name']:<22}{s['currency']:<10}{s['current']:>14,.0f}{s['forecast']:>14,.0f}{s['change_pct']:>+9.2f}%  {s['outlook']:<10}")
+            print("-" * 100)
+
+        if skipped:
+            print(f"\n  Skipped (price <= 50):")
+            for s in skipped:
+                print(f"    - {s['symbol']}: {s['reason']}")
         if results:
             print(f"\n  Successful:")
             for r in results:
@@ -582,6 +652,48 @@ Examples:
             print(f"\n  Failed:")
             for e in errors:
                 print(f"    - {e['symbol']}: {e['error']}")
+
+    # Update watchlist if requested
+    if args.watchlist and forecast_summaries:
+        # Convert forecast summaries to symbols with outlook
+        symbols_with_outlook = [
+            {"symbol": s["symbol"], "outlook": s["outlook"]}
+            for s in forecast_summaries
+        ]
+
+        # Filter based on bullish/bearish flags
+        symbols_to_add = filter_symbols_by_outlook(
+            symbols_with_outlook,
+            bullish_only=args.bullish,
+            bearish_only=args.bearish,
+        )
+
+        if symbols_to_add:
+            print(f"\n{'=' * 70}")
+            print(f"WATCHLIST UPDATE")
+            print(f"{'=' * 70}")
+
+            filter_desc = ""
+            if args.bullish:
+                filter_desc = " (bullish only)"
+            elif args.bearish:
+                filter_desc = " (bearish only)"
+
+            print(f"Adding {len(symbols_to_add)} symbols to watchlist{filter_desc}: {', '.join(symbols_to_add)}")
+
+            try:
+                result = update_watchlist(
+                    args.watchlist_id,
+                    symbols_to_add,
+                    keep_existing=args.keep,
+                    debug=getattr(args, 'wl_debug', False),
+                )
+                print_watchlist_summary(result)
+            except Exception as e:
+                print(f"\nWatchlist update failed: {e}")
+        else:
+            filter_type = "bullish" if args.bullish else "bearish" if args.bearish else ""
+            print(f"\nNo symbols to add to watchlist (filter: {filter_type})")
 
     if errors and not results:
         sys.exit(1)

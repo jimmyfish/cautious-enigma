@@ -761,6 +761,50 @@ def load_groups():
     return groups
 
 
+def has_today_data(symbol: str, target_date: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    """
+    Check if data for target date already exists for a symbol.
+
+    Args:
+        symbol: Stock symbol
+        target_date: Date to check against (YYYY-MM-DD). Defaults to today.
+
+    Returns: (has_data: bool, data_date: Optional[str])
+    """
+    if target_date is None:
+        target_date = date.today().strftime("%Y-%m-%d")
+    base_dir = Path(__file__).parent / "sources" / symbol
+
+    if not base_dir.exists():
+        return False, None
+
+    # Find the latest session directory
+    session_dirs = [d for d in base_dir.iterdir() if d.is_dir() and d.name.isdigit()]
+    if not session_dirs:
+        return False, None
+
+    latest_session = max(session_dirs, key=lambda d: int(d.name))
+    analyzed_file = latest_session / "analyzed.json"
+
+    if not analyzed_file.exists():
+        return False, None
+
+    try:
+        with analyzed_file.open("r", encoding="utf-8") as f:
+            analysis = json.load(f)
+
+        # Check the date from price_feed
+        pf_date = analysis.get("metadata", {}).get("time_horizons", {}).get("price_feed", {}).get("date")
+
+        if pf_date == target_date:
+            return True, pf_date
+
+        return False, pf_date
+
+    except (json.JSONDecodeError, IOError):
+        return False, None
+
+
 def get_symbols_from_input(input_val, groups):
     """
     Returns a list of symbols based on input.
@@ -897,6 +941,10 @@ Examples:
     parser.add_argument("-j", "--jobs", type=int, default=MAX_CONCURRENT_SYMBOLS,
                         help=f"Concurrent symbols (default: {MAX_CONCURRENT_SYMBOLS})")
     parser.add_argument("--list-sectors", action="store_true", help="List sectors")
+    parser.add_argument("--allow-duplicate", action="store_true",
+                        help="Allow re-initiation even if today's data already exists")
+    parser.add_argument("--skip-holiday", action="store_true",
+                        help="Skip market holiday check (for testing)")
 
     args = parser.parse_args()
     groups = load_groups()
@@ -951,11 +999,9 @@ Examples:
         "Referer": "https://stockbit.com/",
     })
 
-    total = len(symbols)
-
     # Check for market holiday before processing
     is_holiday, last_trading_date = check_market_holiday(session)
-    if is_holiday:
+    if is_holiday and not args.skip_holiday:
         today_str = date.today().strftime("%Y-%m-%d")
         holiday_msg = (
             f"<b>Market Holiday</b>\n"
@@ -968,6 +1014,38 @@ Examples:
         send_telegram(holiday_msg)
         sys.exit(0)
 
+    if is_holiday and args.skip_holiday:
+        log(f"{Fore.YELLOW}Market holiday detected but skipping check (--skip-holiday){Style.RESET_ALL}")
+        log(f"{Fore.YELLOW}Using last trading date: {last_trading_date}{Style.RESET_ALL}\n")
+
+    # Determine target date for duplicate check (last trading date on holidays, today otherwise)
+    target_date = last_trading_date if is_holiday else date.today().strftime("%Y-%m-%d")
+
+    # Filter out symbols that already have data for target date (unless --allow-duplicate)
+    if not args.allow_duplicate:
+        skipped_symbols = []
+        symbols_to_process = []
+
+        for symbol in symbols:
+            has_data, data_date = has_today_data(symbol, target_date)
+            if has_data:
+                skipped_symbols.append((symbol, data_date))
+            else:
+                symbols_to_process.append(symbol)
+
+        if skipped_symbols:
+            log(f"{Fore.YELLOW}Skipping {len(skipped_symbols)} symbol(s) with data for {target_date}:{Style.RESET_ALL}")
+            for sym, dt in skipped_symbols:
+                log(f"  {sym} (data from {dt})")
+            log(f"{Fore.YELLOW}Use --allow-duplicate to re-initiate.{Style.RESET_ALL}\n")
+
+        symbols = symbols_to_process
+
+        if not symbols:
+            log(f"{Fore.GREEN}All symbols already have data for {target_date}. Nothing to do.{Style.RESET_ALL}")
+            sys.exit(0)
+
+    total = len(symbols)
     total_retries = 0
     total_failed = 0
     processed = 0

@@ -29,6 +29,15 @@ from idx_rules import (
     get_daily_limit_info,
 )
 
+# Watchlist integration
+from watchlist import (
+    add_watchlist_args,
+    validate_watchlist_args,
+    update_watchlist,
+    print_watchlist_summary,
+    filter_symbols_by_outlook,
+)
+
 # NeuralForecast imports
 from neuralforecast import NeuralForecast
 from neuralforecast.models import LSTM, NBEATS, NHITS, TFT
@@ -1063,7 +1072,18 @@ Examples:
     parser.add_argument("--group", "-g", help="Train with symbol group (e.g., 'banking', 'mining'). Edit models/groups.json to define groups.")
     parser.add_argument("--list-groups", action="store_true", help="List available groups")
 
+    # Add watchlist arguments
+    add_watchlist_args(parser)
+
     args = parser.parse_args()
+
+    # Validate watchlist arguments
+    if hasattr(args, 'watchlist') and args.watchlist:
+        try:
+            validate_watchlist_args(args)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
 
     engine = MarketAlphaEngine(args.source)
     groups = load_groups()
@@ -1163,6 +1183,46 @@ Examples:
         output_file = symbol_csv_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         forecasts.to_csv(output_file, index=False)
         print(f"\nSaved: {output_file}")
+
+        # Update watchlist if requested
+        if args.watchlist:
+            # Determine outlook from forecast
+            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
+            if price_col in forecasts.columns:
+                final_forecast = forecasts[price_col].iloc[-1]
+                pct_change = (final_forecast / last_price - 1) * 100
+
+                if pct_change > 0:
+                    outlook = "BULLISH"
+                elif pct_change < 0:
+                    outlook = "BEARISH"
+                else:
+                    outlook = "NEUTRAL"
+
+                print(f"\nForecast outlook for {symbol}: {outlook} ({pct_change:+.2f}%)")
+
+                # Filter based on bullish/bearish flags
+                symbols_with_outlook = [{"symbol": symbol, "outlook": outlook}]
+                symbols_to_add = filter_symbols_by_outlook(
+                    symbols_with_outlook,
+                    bullish_only=args.bullish,
+                    bearish_only=args.bearish,
+                )
+
+                if symbols_to_add:
+                    try:
+                        result = update_watchlist(
+                            args.watchlist_id,
+                            symbols_to_add,
+                            keep_existing=args.keep,
+                            debug=getattr(args, 'wl_debug', False),
+                        )
+                        print_watchlist_summary(result)
+                    except Exception as e:
+                        print(f"\nWatchlist update failed: {e}")
+                else:
+                    filter_type = "bullish" if args.bullish else "bearish" if args.bearish else ""
+                    print(f"\nNo symbols to add to watchlist (outlook is {outlook}, filter: {filter_type})")
 
     except Exception as e:
         print(f"\nError: {e}")
