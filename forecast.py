@@ -21,6 +21,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# NeuralForecast imports
+from neuralforecast import NeuralForecast
+from neuralforecast.losses.pytorch import DistributionLoss, HuberLoss
+from neuralforecast.models import LSTM, NBEATS, NHITS, TFT
+
 # IDX ARA/ARB rules
 from idx_rules import (
     add_ara_arb_features,
@@ -32,16 +37,11 @@ from idx_rules import (
 # Watchlist integration
 from watchlist import (
     add_watchlist_args,
-    validate_watchlist_args,
-    update_watchlist,
-    print_watchlist_summary,
     filter_symbols_by_outlook,
+    print_watchlist_summary,
+    update_watchlist,
+    validate_watchlist_args,
 )
-
-# NeuralForecast imports
-from neuralforecast import NeuralForecast
-from neuralforecast.models import LSTM, NBEATS, NHITS, TFT
-from neuralforecast.losses.pytorch import HuberLoss, DistributionLoss
 
 warnings.filterwarnings("ignore")
 
@@ -140,7 +140,9 @@ class MarketAlphaEngine:
                 pass
 
         if not ds:
-            ds = datetime.now() - timedelta(days=int(session) if session.isdigit() else 0)
+            ds = datetime.now() - timedelta(
+                days=int(session) if session.isdigit() else 0
+            )
 
         # Calculate OBI from depth section (pre-computed totals)
         depth = analysis.get("depth", {})
@@ -203,7 +205,9 @@ class MarketAlphaEngine:
 
         # Calculate foreign ratio
         total_foreign = foreign_buy + foreign_sell
-        foreign_ratio = foreign_net_val / (total_foreign + 1e-5) if total_foreign > 0 else 0.0
+        foreign_ratio = (
+            foreign_net_val / (total_foreign + 1e-5) if total_foreign > 0 else 0.0
+        )
 
         # Volatility
         volatility = (high - low) / (close + 1e-5) if close > 0 else 0.0
@@ -433,6 +437,7 @@ class StockForecaster:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         import torch
+
         for i, model in enumerate(self.nf.models):
             model_name = model.__class__.__name__
             ckpt_path = ckpt_dir / f"{model_name}_{i}.pt"
@@ -475,6 +480,7 @@ class StockForecaster:
             return models
 
         import torch
+
         loaded_count = 0
 
         for i, model in enumerate(models):
@@ -483,15 +489,21 @@ class StockForecaster:
 
             if ckpt_path.exists():
                 try:
-                    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                    state_dict = torch.load(
+                        ckpt_path, map_location="cpu", weights_only=True
+                    )
                     # Load with strict=False to handle minor architecture differences
                     model.load_state_dict(state_dict, strict=False)
                     loaded_count += 1
                 except Exception as e:
-                    print(f"    Warning: Could not load checkpoint for {model_name}: {e}")
+                    print(
+                        f"    Warning: Could not load checkpoint for {model_name}: {e}"
+                    )
 
         if loaded_count > 0:
-            print(f"  Loaded {loaded_count}/{len(models)} model checkpoints (warm-start)")
+            print(
+                f"  Loaded {loaded_count}/{len(models)} model checkpoints (warm-start)"
+            )
 
         return models
 
@@ -524,7 +536,11 @@ class StockForecaster:
 
         # Build NeuralForecast dataframe
         nf_df = pd.DataFrame(
-            {"unique_id": df_with_limits["unique_id"], "ds": df_with_limits["ds"], "y": df_with_limits["y"]}
+            {
+                "unique_id": df_with_limits["unique_id"],
+                "ds": df_with_limits["ds"],
+                "y": df_with_limits["y"],
+            }
         )
 
         # Add exogenous features
@@ -554,7 +570,9 @@ class StockForecaster:
         if "limit_hit" in nf_df.columns:
             limit_days = nf_df["limit_hit"].sum()
             if limit_days > 0:
-                print(f"  ARA/ARB limit days detected: {int(limit_days)} ({limit_days/len(nf_df)*100:.1f}%)")
+                print(
+                    f"  ARA/ARB limit days detected: {int(limit_days)} ({limit_days / len(nf_df) * 100:.1f}%)"
+                )
 
         return nf_df, available_exog
 
@@ -569,10 +587,7 @@ class StockForecaster:
             # Need OHLC columns for ARA/ARB calculation
             if all(c in uid_df.columns for c in ["close", "high", "low"]):
                 uid_df = add_ara_arb_features(
-                    uid_df,
-                    close_col="close",
-                    high_col="high",
-                    low_col="low"
+                    uid_df, close_col="close", high_col="high", low_col="low"
                 )
             elif "y" in uid_df.columns:
                 # Fallback: use y as close, estimate high/low
@@ -580,12 +595,11 @@ class StockForecaster:
                 uid_df["_high"] = uid_df["y"]
                 uid_df["_low"] = uid_df["y"]
                 uid_df = add_ara_arb_features(
-                    uid_df,
-                    close_col="_close",
-                    high_col="_high",
-                    low_col="_low"
+                    uid_df, close_col="_close", high_col="_high", low_col="_low"
                 )
-                uid_df = uid_df.drop(columns=["_close", "_high", "_low"], errors="ignore")
+                uid_df = uid_df.drop(
+                    columns=["_close", "_high", "_low"], errors="ignore"
+                )
 
             result_dfs.append(uid_df)
 
@@ -622,7 +636,9 @@ class StockForecaster:
 
             # Fill other numeric columns
             for col in merged.columns:
-                if col not in ["ds", "unique_id", "available_mask"] and merged[col].dtype in ["float64", "int64"]:
+                if col not in ["ds", "unique_id", "available_mask"] and merged[
+                    col
+                ].dtype in ["float64", "int64"]:
                     merged[col] = merged[col].ffill().bfill().fillna(0)
 
             result_dfs.append(merged)
@@ -631,12 +647,16 @@ class StockForecaster:
             result = pd.concat(result_dfs, ignore_index=True)
             gap_count = (result["available_mask"] == 0).sum()
             if gap_count > 0:
-                print(f"  Filled {gap_count} gaps in time series (marked with available_mask=0)")
+                print(
+                    f"  Filled {gap_count} gaps in time series (marked with available_mask=0)"
+                )
             return result
 
         return df
 
-    def create_models(self, input_size: int, exog_vars: List[str], max_steps: int = 200):
+    def create_models(
+        self, input_size: int, exog_vars: List[str], max_steps: int = 200
+    ):
         """Create models with improved loss functions for robust forecasting."""
 
         effective_input = max(min(input_size, 24), 2)
@@ -679,7 +699,9 @@ class StockForecaster:
 
         return models
 
-    def train_and_forecast(self, df: pd.DataFrame, force_retrain: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def train_and_forecast(
+        self, df: pd.DataFrame, force_retrain: bool = False
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Train models and generate forecasts. Supports incremental training."""
 
         nf_df, exog_vars = self.prepare_data(df)
@@ -696,7 +718,9 @@ class StockForecaster:
         # Auto-adjust horizon if not enough data
         min_records = 3  # Absolute minimum
         if current_data_count < min_records:
-            raise ValueError(f"Need at least {min_records} records (have {current_data_count})")
+            raise ValueError(
+                f"Need at least {min_records} records (have {current_data_count})"
+            )
 
         # Adjust horizon to fit available data
         max_horizon = max(current_data_count - 2, 1)
@@ -724,14 +748,18 @@ class StockForecaster:
             new_data = current_data_count - prev_count
 
             if new_data > 0:
-                print(f"\n  New data detected: {new_data} records ({prev_count} -> {current_data_count})")
-                print(f"  Strategy: Fine-tuning with reduced steps")
+                print(
+                    f"\n  New data detected: {new_data} records ({prev_count} -> {current_data_count})"
+                )
+                print("  Strategy: Fine-tuning with reduced steps")
                 use_fine_tuning = True
                 max_steps = 50  # Reduced steps for fine-tuning
             elif new_data == 0:
-                print(f"\n  No new data. Using saved model directly.")
+                print("\n  No new data. Using saved model directly.")
                 # Just predict with existing model
-                print(f"\nGenerating {self.horizon}-step forecast (using cached model)...")
+                print(
+                    f"\nGenerating {self.horizon}-step forecast (using cached model)..."
+                )
 
                 # Predict only for requested symbol if using group training
                 if self.group and self.symbol:
@@ -745,11 +773,11 @@ class StockForecaster:
 
                 return forecasts, nf_df
             else:
-                print(f"\n  Data reduced. Retraining from scratch.")
+                print("\n  Data reduced. Retraining from scratch.")
                 saved_meta = None
 
         if saved_meta is None:
-            print(f"\n  Strategy: Training from scratch (no saved model)")
+            print("\n  Strategy: Training from scratch (no saved model)")
 
         models = self.create_models(input_size, exog_vars, max_steps=max_steps)
 
@@ -759,7 +787,10 @@ class StockForecaster:
 
         print(f"\nModels: {[m.__class__.__name__ for m in models]}")
         print(f"Lookback: {min(input_size, 24)} | Horizon: {self.horizon}")
-        print(f"Max steps: {max_steps}" + (" (warm-start fine-tuning)" if use_fine_tuning else " (full training)"))
+        print(
+            f"Max steps: {max_steps}"
+            + (" (warm-start fine-tuning)" if use_fine_tuning else " (full training)")
+        )
 
         # Initialize and train
         self.nf = NeuralForecast(models=models, freq="D")
@@ -777,14 +808,18 @@ class StockForecaster:
                 forecasts = self.nf.predict(df=symbol_df)
                 print(f"  Predicting for {self.symbol} only")
             else:
-                print(f"  Warning: {self.symbol} not found in group data, predicting all")
+                print(
+                    f"  Warning: {self.symbol} not found in group data, predicting all"
+                )
                 forecasts = self.nf.predict()
         else:
             forecasts = self.nf.predict()
 
         return forecasts, nf_df
 
-    def ensemble_forecast(self, forecasts: pd.DataFrame, last_price: float) -> pd.DataFrame:
+    def ensemble_forecast(
+        self, forecasts: pd.DataFrame, last_price: float
+    ) -> pd.DataFrame:
         """Create ensemble from all models and apply ARA/ARB clamping."""
         model_cols = [c for c in forecasts.columns if c not in ["ds", "unique_id"]]
 
@@ -801,9 +836,7 @@ class StockForecaster:
             # Apply ARA/ARB clamping to forecasts
             # This ensures predictions don't exceed daily price limits
             forecasts = clamp_forecast_series(
-                forecasts,
-                last_price,
-                price_col="ensemble"
+                forecasts, last_price, price_col="ensemble"
             )
 
             # Also clamp low/high to ARA/ARB
@@ -812,7 +845,9 @@ class StockForecaster:
             if "high_clamped" in forecasts.columns:
                 forecasts["ensemble_high"] = forecasts["high_clamped"]
 
-            print(f"\n  Forecasts clamped to ARA/ARB limits (based on {last_price:,.0f} IDR)")
+            print(
+                f"\n  Forecasts clamped to ARA/ARB limits (based on {last_price:,.0f} IDR)"
+            )
 
         return forecasts
 
@@ -826,8 +861,12 @@ def print_forecast_table(forecasts: pd.DataFrame, symbol: str, last_price: float
     # Show ARA/ARB limits for first day
     limit_info = get_daily_limit_info(last_price)
     print(f"\nARA/ARB Limits (Day 1 based on {last_price:,.0f} IDR):")
-    print(f"  ARA (Upper): {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)")
-    print(f"  ARB (Lower): {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)")
+    print(
+        f"  ARA (Upper): {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)"
+    )
+    print(
+        f"  ARB (Lower): {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)"
+    )
 
     # Determine which columns to show
     show_clamped = "ensemble_clamped" in forecasts.columns
@@ -842,10 +881,11 @@ def print_forecast_table(forecasts: pd.DataFrame, symbol: str, last_price: float
     else:
         print(f"{'Forecast':>12}", end="")
     print(f"{'Change':>10}")
-    print("-" * (12 + (44 if show_clamped and has_limits else 22 if show_clamped else 22)))
+    print(
+        "-" * (12 + (44 if show_clamped and has_limits else 22 if show_clamped else 22))
+    )
 
     # Data - use clamped values if available
-    price_col = "ensemble_clamped" if show_clamped else "ensemble"
     for _, row in forecasts.iterrows():
         date_str = (
             row["ds"].strftime("%Y-%m-%d")
@@ -878,18 +918,26 @@ def print_forecast_table(forecasts: pd.DataFrame, symbol: str, last_price: float
         print(f"  Last price:      {last_price:>14,.0f}")
 
         if show_clamped:
-            print(f"\n  Original (unclamped):")
+            print("\n  Original (unclamped):")
             print(f"    Forecast mean:   {forecasts['ensemble'].mean():>12,.0f}")
-            print(f"    Forecast range:  {forecasts['ensemble'].min():>12,.0f} - {forecasts['ensemble'].max():,.0f}")
+            print(
+                f"    Forecast range:  {forecasts['ensemble'].min():>12,.0f} - {forecasts['ensemble'].max():,.0f}"
+            )
 
-            print(f"\n  Clamped (within ARA/ARB):")
-            print(f"    Forecast mean:   {forecasts['ensemble_clamped'].mean():>12,.0f}")
-            print(f"    Forecast range:  {forecasts['ensemble_clamped'].min():>12,.0f} - {forecasts['ensemble_clamped'].max():,.0f}")
+            print("\n  Clamped (within ARA/ARB):")
+            print(
+                f"    Forecast mean:   {forecasts['ensemble_clamped'].mean():>12,.0f}"
+            )
+            print(
+                f"    Forecast range:  {forecasts['ensemble_clamped'].min():>12,.0f} - {forecasts['ensemble_clamped'].max():,.0f}"
+            )
 
             final_forecast = forecasts["ensemble_clamped"].iloc[-1]
         else:
             print(f"  Forecast mean:   {forecasts['ensemble'].mean():>14,.0f}")
-            print(f"  Forecast range:  {forecasts['ensemble'].min():>14,.0f} - {forecasts['ensemble'].max():,.0f}")
+            print(
+                f"  Forecast range:  {forecasts['ensemble'].min():>14,.0f} - {forecasts['ensemble'].max():,.0f}"
+            )
             final_forecast = forecasts["ensemble"].iloc[-1]
 
         pct = (final_forecast / last_price - 1) * 100
@@ -898,7 +946,9 @@ def print_forecast_table(forecasts: pd.DataFrame, symbol: str, last_price: float
 
         if "ensemble_std" in forecasts.columns:
             avg_std = forecasts["ensemble_std"].mean()
-            print(f"  Uncertainty:     {avg_std:>14,.0f} (+/- {avg_std / last_price * 100:.2f}%)")
+            print(
+                f"  Uncertainty:     {avg_std:>14,.0f} (+/- {avg_std / last_price * 100:.2f}%)"
+            )
 
 
 def plot_results(
@@ -945,12 +995,18 @@ def plot_results(
 
         if "ensemble" in forecasts.columns:
             # Plot clamped forecast if available, otherwise original
-            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
+            price_col = (
+                "ensemble_clamped"
+                if "ensemble_clamped" in forecasts.columns
+                else "ensemble"
+            )
             ax1.plot(
                 forecasts["ds"],
                 forecasts[price_col],
                 "r-o",
-                label="Ensemble (Clamped)" if "ensemble_clamped" in forecasts.columns else "Ensemble",
+                label="Ensemble (Clamped)"
+                if "ensemble_clamped" in forecasts.columns
+                else "Ensemble",
                 linewidth=2,
                 markersize=6,
             )
@@ -1035,7 +1091,9 @@ def plot_results(
 
         plot_dir = Path("plot") / symbol
         plot_dir.mkdir(parents=True, exist_ok=True)
-        output_path = plot_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        output_path = (
+            plot_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        )
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {output_path}")
         plt.close()
@@ -1065,12 +1123,25 @@ Examples:
 
     parser.add_argument("symbol", nargs="?", help="Stock symbol")
     parser.add_argument("--horizon", "-n", type=int, default=5, help="Forecast horizon")
-    parser.add_argument("--no-plot", action="store_true", help="Disable plot generation")
+    parser.add_argument(
+        "--no-plot", action="store_true", help="Disable plot generation"
+    )
     parser.add_argument("--list", "-l", action="store_true", help="List symbols")
     parser.add_argument("--source", "-s", default="sources", help="Data directory")
-    parser.add_argument("--retrain", "-r", action="store_true", help="Force retrain from scratch (ignore saved model)")
-    parser.add_argument("--group", "-g", help="Train with symbol group (e.g., 'banking', 'mining'). Edit models/groups.json to define groups.")
-    parser.add_argument("--list-groups", action="store_true", help="List available groups")
+    parser.add_argument(
+        "--retrain",
+        "-r",
+        action="store_true",
+        help="Force retrain from scratch (ignore saved model)",
+    )
+    parser.add_argument(
+        "--group",
+        "-g",
+        help="Train with symbol group (e.g., 'banking', 'mining'). Edit models/groups.json to define groups.",
+    )
+    parser.add_argument(
+        "--list-groups", action="store_true", help="List available groups"
+    )
 
     # Add watchlist arguments
     add_watchlist_args(parser)
@@ -1078,7 +1149,7 @@ Examples:
     args = parser.parse_args()
 
     # Validate watchlist arguments
-    if hasattr(args, 'watchlist') and args.watchlist:
+    if hasattr(args, "watchlist") and args.watchlist:
         try:
             validate_watchlist_args(args)
         except ValueError as e:
@@ -1099,8 +1170,7 @@ Examples:
             print("Available groups (edit models/groups.json to modify):")
             for name, symbols in groups.items():
                 colored = [
-                    s if s in available_symbols else f"{RED}{s}{RESET}"
-                    for s in symbols
+                    s if s in available_symbols else f"{RED}{s}{RESET}" for s in symbols
                 ]
                 print(f"  {name}: {', '.join(colored)}")
         return
@@ -1158,7 +1228,9 @@ Examples:
 
         # Get last price for the target symbol
         symbol_data = df[df["unique_id"] == symbol] if group_name else df
-        last_price = symbol_data["y"].iloc[-1] if not symbol_data.empty else df["y"].iloc[-1]
+        last_price = (
+            symbol_data["y"].iloc[-1] if not symbol_data.empty else df["y"].iloc[-1]
+        )
         print(f"Last price ({symbol}): {last_price:,.2f}")
 
         # Show alpha feature summary
@@ -1167,8 +1239,12 @@ Examples:
         print(f"  Buy Concentration avg: {df['buy_concentration'].mean():.2%}")
         print(f"  Foreign Net total: {df['foreign_net'].sum():,.0f}")
 
-        forecaster = StockForecaster(horizon=args.horizon, symbol=symbol, group=group_name)
-        forecasts, historical = forecaster.train_and_forecast(df, force_retrain=args.retrain)
+        forecaster = StockForecaster(
+            horizon=args.horizon, symbol=symbol, group=group_name
+        )
+        forecasts, historical = forecaster.train_and_forecast(
+            df, force_retrain=args.retrain
+        )
         forecasts = forecaster.ensemble_forecast(forecasts, last_price)
 
         print_forecast_table(forecasts, symbol, last_price)
@@ -1180,14 +1256,20 @@ Examples:
 
         symbol_csv_dir = CSV_DIR / symbol
         symbol_csv_dir.mkdir(parents=True, exist_ok=True)
-        output_file = symbol_csv_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        output_file = (
+            symbol_csv_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        )
         forecasts.to_csv(output_file, index=False)
         print(f"\nSaved: {output_file}")
 
         # Update watchlist if requested
         if args.watchlist:
             # Determine outlook from forecast
-            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
+            price_col = (
+                "ensemble_clamped"
+                if "ensemble_clamped" in forecasts.columns
+                else "ensemble"
+            )
             if price_col in forecasts.columns:
                 final_forecast = forecasts[price_col].iloc[-1]
                 pct_change = (final_forecast / last_price - 1) * 100
@@ -1199,7 +1281,9 @@ Examples:
                 else:
                     outlook = "NEUTRAL"
 
-                print(f"\nForecast outlook for {symbol}: {outlook} ({pct_change:+.2f}%)")
+                print(
+                    f"\nForecast outlook for {symbol}: {outlook} ({pct_change:+.2f}%)"
+                )
 
                 # Filter based on bullish/bearish flags
                 symbols_with_outlook = [{"symbol": symbol, "outlook": outlook}]
@@ -1215,14 +1299,18 @@ Examples:
                             args.watchlist_id,
                             symbols_to_add,
                             keep_existing=args.keep,
-                            debug=getattr(args, 'wl_debug', False),
+                            debug=getattr(args, "wl_debug", False),
                         )
                         print_watchlist_summary(result)
                     except Exception as e:
                         print(f"\nWatchlist update failed: {e}")
                 else:
-                    filter_type = "bullish" if args.bullish else "bearish" if args.bearish else ""
-                    print(f"\nNo symbols to add to watchlist (outlook is {outlook}, filter: {filter_type})")
+                    filter_type = (
+                        "bullish" if args.bullish else "bearish" if args.bearish else ""
+                    )
+                    print(
+                        f"\nNo symbols to add to watchlist (outlook is {outlook}, filter: {filter_type})"
+                    )
 
     except Exception as e:
         print(f"\nError: {e}")

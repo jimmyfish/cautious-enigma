@@ -37,7 +37,9 @@ def normalize_auth(token):
     return token if token.startswith("Bearer ") else f"Bearer {token}"
 
 
-def fetch_screener(template_id: int, auth_token: str, output_path: Path) -> Optional[List[str]]:
+def fetch_screener(
+    template_id: int, auth_token: str, output_path: Path
+) -> Optional[List[str]]:
     """
     Fetch screener template results and save to JSON file.
 
@@ -75,9 +77,9 @@ def fetch_screener(template_id: int, auth_token: str, output_path: Path) -> Opti
             print(f"  Saved to: {output_path}")
             return symbols
         else:
-            print(f"Fetched screener data")
+            print("Fetched screener data")
             print(f"  Saved to: {output_path}")
-            print(f"  Warning: Unexpected response structure")
+            print("  Warning: Unexpected response structure")
             return []
 
     except requests.exceptions.RequestException as e:
@@ -193,7 +195,8 @@ Examples:
     )
 
     parser.add_argument(
-        "-t", "--template",
+        "-t",
+        "--template",
         type=int,
         default=4475032,
         dest="template_id",
@@ -245,7 +248,7 @@ Examples:
         print("\nNo symbols found in screener")
         sys.exit(0)
 
-    print(f"\nScreener data fetched successfully!")
+    print("\nScreener data fetched successfully!")
 
     # Run forecaster if requested
     if args.forecast:

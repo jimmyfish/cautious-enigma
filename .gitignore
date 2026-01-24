@@ -10,3 +10,4 @@ subsectors.md
 **/__pycache__
 plot/
 csv/
+*.zip

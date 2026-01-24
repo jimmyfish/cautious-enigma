@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Intraday Stock Forecasting - Single Session
+Intraday Stock Forecasting - Single Session (Production Grade)
+
 Forecasts next trading session based on tick data from running-trade.json.
+Supports incremental training, model persistence, and group training.
 
 Usage:
     python short.py SYMBOL --hours 3          # Forecast next 3 hours
@@ -13,233 +15,432 @@ Example:
     python short.py ICBP --hours 3 --interval 5
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import logging
 import sys
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum, auto
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, Final, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from neuralforecast import NeuralForecast
+from neuralforecast.losses.pytorch import DistributionLoss, HuberLoss
+from neuralforecast.models import LSTM, NBEATS, NHITS
 
 # IDX ARA/ARB rules
-from idx_rules import (
-    add_ara_arb_features,
-    clamp_price_to_limit,
-    calculate_ara_arb,
-    get_daily_limit_info,
-)
+from idx_rules import calculate_ara_arb
 
 # Watchlist integration
 from watchlist import (
     add_watchlist_args,
-    validate_watchlist_args,
-    update_watchlist,
-    print_watchlist_summary,
     filter_symbols_by_outlook,
+    print_watchlist_summary,
+    update_watchlist,
+    validate_watchlist_args,
 )
 
-from neuralforecast import NeuralForecast
-from neuralforecast.models import LSTM, NBEATS, NHITS
-from neuralforecast.losses.pytorch import HuberLoss, DistributionLoss
-
+# Suppress warnings after imports
 warnings.filterwarnings("ignore")
 
-# Model persistence directory
-MODELS_DIR = Path("models")
-MODELS_DIR.mkdir(exist_ok=True)
+# =============================================================================
+# Constants
+# =============================================================================
 
-# CSV output directory
-CSV_DIR = Path("csv")
+# Directories
+MODELS_DIR: Final[Path] = Path("models")
+CSV_DIR: Final[Path] = Path("csv")
+PLOT_DIR: Final[Path] = Path("plot")
+SOURCES_DIR: Final[Path] = Path("sources")
+GROUPS_FILE: Final[Path] = MODELS_DIR / "groups.json"
+
+# Create directories
+MODELS_DIR.mkdir(exist_ok=True)
 CSV_DIR.mkdir(exist_ok=True)
 
-# Groups config file
-GROUPS_FILE = MODELS_DIR / "groups.json"
+# Model configuration
+DEFAULT_INTERVAL: Final[int] = 5  # minutes
+DEFAULT_SESSION: Final[str] = "1"
+MIN_BARS_REQUIRED: Final[int] = 5
+MAX_TRAINING_STEPS: Final[int] = 200
+FINE_TUNE_STEPS: Final[int] = 50
+RANDOM_SEED: Final[int] = 42
 
 
-def load_groups() -> dict:
-    """Load stock groups from config file."""
-    if not GROUPS_FILE.exists():
-        return {}
-    try:
-        with open(GROUPS_FILE, "r") as f:
-            groups = json.load(f)
-        return {k: v for k, v in groups.items() if not k.startswith("_")}
-    except (json.JSONDecodeError, IOError):
-        return {}
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+
+def _setup_logging(level: int = logging.INFO) -> logging.Logger:
+    """Configure and return the application logger."""
+    logger = logging.getLogger("short_forecast")
+    logger.setLevel(level)
+
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+        logger.addHandler(handler)
+
+    return logger
 
 
-def find_group_for_symbol(symbol: str, groups: dict) -> Optional[str]:
-    """Find which group a symbol belongs to."""
-    for group_name, symbols in groups.items():
-        if symbol.upper() in [s.upper() for s in symbols]:
-            return group_name
-    return None
+logger = _setup_logging()
+
+
+# =============================================================================
+# Custom Exceptions
+# =============================================================================
+
+class ForecastError(Exception):
+    """Base exception for forecasting errors."""
+    pass
+
+
+class DataError(ForecastError):
+    """Data loading or processing error."""
+    pass
+
+
+class InsufficientDataError(DataError):
+    """Not enough data points for forecasting."""
+    def __init__(self, available: int, required: int = MIN_BARS_REQUIRED):
+        super().__init__(f"Need at least {required} bars (have {available})")
+        self.available = available
+        self.required = required
+
+
+class SymbolNotFoundError(DataError):
+    """Requested symbol not found."""
+    def __init__(self, symbol: str, available: List[str]):
+        super().__init__(
+            f"Symbol '{symbol}' not found. Available: {', '.join(sorted(available))}"
+        )
+        self.symbol = symbol
+        self.available = available
+
+
+class SessionNotFoundError(DataError):
+    """Requested session not found."""
+    def __init__(self, session: str, available: List[str]):
+        super().__init__(
+            f"Session '{session}' not found. Available: {', '.join(available)}"
+        )
+        self.session = session
+        self.available = available
+
+
+class GroupNotFoundError(DataError):
+    """Requested group not found."""
+    def __init__(self, group: str, available: List[str]):
+        super().__init__(
+            f"Group '{group}' not found. Available: {', '.join(available)}"
+        )
+        self.group = group
+        self.available = available
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+class Outlook(Enum):
+    """Forecast outlook classification."""
+    BULLISH = auto()
+    BEARISH = auto()
+    NEUTRAL = auto()
+
+    @classmethod
+    def from_price_change(cls, current: float, forecast: float) -> "Outlook":
+        """Determine outlook from price change."""
+        if forecast > current:
+            return cls.BULLISH
+        elif forecast < current:
+            return cls.BEARISH
+        return cls.NEUTRAL
+
+
+@dataclass(frozen=True)
+class SessionConfig:
+    """Configuration for a trading session."""
+    start: str
+    end: str
+    hours: float
+
+
+@dataclass
+class ARAARBLimits:
+    """ARA/ARB price limits for a stock."""
+    prev_close: float
+    ara: float
+    arb: float
+
+    @property
+    def ara_pct(self) -> float:
+        return (self.ara / self.prev_close - 1) * 100
+
+    @property
+    def arb_pct(self) -> float:
+        return (1 - self.arb / self.prev_close) * 100
 
 
 # IDX Market Hours (WIB/GMT+7)
 # Source: https://www.idx.co.id/id/produk/mekanisme-dan-jam-perdagangan
-# Berdasarkan SK Direksi BEI Nomor II-A Kep-00003/BEI/04-2025
-#
-# Monday-Thursday (Senin-Kamis):
-#   Pre-opening: 08:45-09:00
-#   Session 1: 09:00-12:00 (3 hours)
-#   Lunch: 12:00-13:30
-#   Session 2: 13:30-15:50 (2h20m)
-#   Pre-closing: 15:50-16:00
-#   Post-trading: 16:02-16:15
-#
-# Friday (Jumat):
-#   Session 1: 09:00-11:30 (2.5 hours)
-#   Session 2: 14:00-15:50 (1h50m)
-
-MARKET_SESSIONS = {
-    "session1": {"start": "09:00", "end": "12:00", "hours": 3.0},           # Morning (Mon-Thu)
-    "session1_fri": {"start": "09:00", "end": "11:30", "hours": 2.5},       # Morning (Friday)
-    "session2": {"start": "13:30", "end": "15:50", "hours": 2.33},          # Afternoon (Mon-Thu)
-    "session2_fri": {"start": "14:00", "end": "15:50", "hours": 1.83},      # Afternoon (Friday)
-    "pre_open": {"start": "08:45", "end": "09:00", "hours": 0.25},          # Pre-opening
-    "pre_close": {"start": "15:50", "end": "16:00", "hours": 0.17},         # Pre-closing
-    "post_trade": {"start": "16:02", "end": "16:15", "hours": 0.22},        # Post-trading
+# Based on: SK Direksi BEI Nomor II-A Kep-00003/BEI/04-2025
+MARKET_SESSIONS: Final[Dict[str, SessionConfig]] = {
+    "session1": SessionConfig("09:00", "12:00", 3.0),           # Morning (Mon-Thu)
+    "session1_fri": SessionConfig("09:00", "11:30", 2.5),       # Morning (Friday)
+    "session2": SessionConfig("13:30", "15:50", 2.33),          # Afternoon (Mon-Thu)
+    "session2_fri": SessionConfig("14:00", "15:50", 1.83),      # Afternoon (Friday)
+    "pre_open": SessionConfig("08:45", "09:00", 0.25),          # Pre-opening
+    "pre_close": SessionConfig("15:50", "16:00", 0.17),         # Pre-closing
+    "post_trade": SessionConfig("16:02", "16:15", 0.22),        # Post-trading
 }
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def _require_non_empty(df: pd.DataFrame, message: str) -> None:
+    """Validate that DataFrame is not empty."""
+    if df.empty:
+        raise DataError(message)
+
+
+def _safe_last(series: pd.Series, default: Any = None) -> Any:
+    """Safely get last value from series."""
+    if series.empty:
+        if default is None:
+            raise DataError("Cannot read last value from empty series")
+        return default
+    return series.iloc[-1]
+
+
+def load_groups() -> Dict[str, List[str]]:
+    """Load stock groups from config file."""
+    if not GROUPS_FILE.exists():
+        return {}
+
+    try:
+        with GROUPS_FILE.open("r") as f:
+            groups = json.load(f)
+        return {k: v for k, v in groups.items() if not k.startswith("_")}
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"Failed to load groups: {e}")
+        return {}
+
+
+def find_group_for_symbol(symbol: str, groups: Dict[str, List[str]]) -> Optional[str]:
+    """Find which group a symbol belongs to."""
+    symbol_upper = symbol.upper()
+    for group_name, symbols in groups.items():
+        if symbol_upper in (s.upper() for s in symbols):
+            return group_name
+    return None
 
 
 class TickToOHLCV:
     """Convert tick-level trade data to OHLCV bars."""
 
-    def __init__(self, base_path: str = "sources"):
+    # Feature columns for forecasting
+    EXOG_COLUMNS: List[str] = [
+        "volume", "volatility", "buy_pressure", "foreign_net", "momentum", "vol_ratio"
+    ]
+
+    def __init__(self, base_path: Union[str, Path] = SOURCES_DIR):
         self.base_path = Path(base_path)
 
-    def load_json(self, filepath: Path) -> Optional[dict]:
+    def _load_json(self, filepath: Path) -> Optional[Dict]:
+        """Load JSON file with error handling."""
         try:
-            with open(filepath, "r") as f:
+            with filepath.open("r") as f:
                 return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
+            logger.debug(f"File not found: {filepath}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in {filepath}: {e}")
             return None
 
-    def parse_number(self, val) -> float:
-        if val is None:
-            return 0.0
-        if isinstance(val, (int, float)):
-            return float(val)
-        return float(str(val).replace(",", "") or 0)
+    @staticmethod
+    def _parse_number_series(series: pd.Series) -> pd.Series:
+        """Vectorized parsing of number strings (from Gemini)."""
+        result = pd.to_numeric(
+            series.astype(str).str.replace(",", ""), errors="coerce"
+        )
+        return pd.Series(result).fillna(0.0)
 
-    def get_session_date(self, session_path: Path) -> datetime:
+    def _get_session_date(self, session_path: Path) -> datetime:
         """Extract date from analyzed.json file."""
-        analysis = self.load_json(session_path / "analyzed.json")
+        analysis = self._load_json(session_path / "analyzed.json")
         if analysis:
             time_horizons = analysis.get("metadata", {}).get("time_horizons", {})
             md_to = time_horizons.get("market_detector", {}).get("to")
             if md_to:
                 try:
                     return datetime.strptime(md_to, "%Y-%m-%d")
-                except:
+                except ValueError:
                     pass
         return datetime.now()
 
-    def parse_trades(self, trades: List[dict], base_date: datetime) -> pd.DataFrame:
-        """Parse running trades into a DataFrame."""
-        records = []
-
-        for trade in trades:
-            try:
-                price = self.parse_number(trade.get("price", 0))
-                lot = self.parse_number(trade.get("lot", 0))
-                time_str = trade.get("time", "09:00:00")
-
-                if price <= 0 or lot <= 0:
-                    continue
-
-                parts = time_str.split(":")
-                hour = int(parts[0])
-                minute = int(parts[1])
-                second = int(parts[2]) if len(parts) > 2 else 0
-                timestamp = base_date.replace(hour=hour, minute=minute, second=second)
-
-                records.append(
-                    {
-                        "timestamp": timestamp,
-                        "price": price,
-                        "lot": lot,
-                        "value": price * lot * 100,
-                        "action": trade.get("action", ""),
-                        "buyer_type": trade.get("buyer_type", ""),
-                        "seller_type": trade.get("seller_type", ""),
-                    }
-                )
-            except:
-                continue
-
-        if not records:
+    def _parse_trades_vectorized(
+        self, trades: List[Dict], base_date: datetime
+    ) -> pd.DataFrame:
+        """
+        Vectorized trade parsing - bulk DataFrame operations instead of loops.
+        (Adapted from Gemini's approach)
+        """
+        if not trades:
             return pd.DataFrame()
 
-        df = pd.DataFrame(records)
-        return df.sort_values("timestamp").reset_index(drop=True)
+        df = pd.DataFrame(trades)
 
-    def aggregate_bars(self, tick_df: pd.DataFrame, interval: int = 5) -> pd.DataFrame:
-        """Aggregate ticks to OHLCV bars."""
+        # Check required columns
+        required_cols = ["price", "lot", "time"]
+        if not all(col in df.columns for col in required_cols):
+            return pd.DataFrame()
+
+        # Vectorized type conversion
+        price_series: pd.Series = df["price"]  # type: ignore[assignment]
+        lot_series: pd.Series = df["lot"]  # type: ignore[assignment]
+        df["price"] = self._parse_number_series(price_series)
+        df["lot"] = self._parse_number_series(lot_series)
+
+        # Filter invalid trades
+        df = df[(df["price"] > 0) & (df["lot"] > 0)]
+        if df.empty:
+            return pd.DataFrame()
+
+        # Vectorized time parsing
+        time_col: pd.Series = df["time"]  # type: ignore[assignment]
+        time_split = time_col.astype(str).str.split(":", expand=True)
+
+        # Build timestamps from components (faster than string parsing)
+        try:
+            timestamps = pd.to_datetime(pd.DataFrame({
+                "year": base_date.year,
+                "month": base_date.month,
+                "day": base_date.day,
+                "hour": time_split[0].astype(int),
+                "minute": time_split[1].astype(int),
+                "second": time_split[2].astype(int) if time_split.shape[1] > 2 else 0,
+            }))
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Time parsing error: {e}")
+            return pd.DataFrame()
+
+        df["timestamp"] = timestamps
+        df["value"] = df["price"] * df["lot"] * 100
+
+        # Use category dtype for string columns (memory optimization from Gemini)
+        for col in ["action", "buyer_type", "seller_type"]:
+            if col in df.columns:
+                col_series: pd.Series = df[col]  # type: ignore[assignment]
+                df[col] = col_series.fillna("").astype("category")
+            else:
+                df[col] = pd.Categorical([""] * len(df))
+
+        return df.sort_values("timestamp").reset_index(drop=True)  # type: ignore[return-value]
+
+    def _aggregate_bars(self, tick_df: pd.DataFrame, interval: int) -> pd.DataFrame:
+        """
+        Aggregate ticks to OHLCV bars using single-pass aggregation.
+        (Adapted from Gemini's approach)
+        """
         if tick_df.empty:
             return pd.DataFrame()
 
         df = tick_df.set_index("timestamp")
+        freq = f"{interval}min"
 
-        ohlcv = df["price"].resample(f"{interval}min").ohlc()
-        ohlcv.columns = ["open", "high", "low", "close"]
+        # Pre-calculate masks for volume breakdown (avoids repeated filtering)
+        is_buy = df["action"].astype(str) == "buy"
+        is_foreign_buy = df["buyer_type"].astype(str).str.contains("FOREIGN", na=False, case=False)
+        is_foreign_sell = df["seller_type"].astype(str).str.contains("FOREIGN", na=False, case=False)
 
-        ohlcv["volume"] = df["lot"].resample(f"{interval}min").sum()
-        ohlcv["value"] = df["value"].resample(f"{interval}min").sum()
-        ohlcv["trades"] = df["price"].resample(f"{interval}min").count()
+        # Pre-calculate volume columns
+        df = df.assign(
+            buy_vol=df["lot"].where(is_buy, 0),
+            sell_vol=df["lot"].where(~is_buy, 0),
+            f_buy=df["lot"].where(is_foreign_buy, 0),
+            f_sell=df["lot"].where(is_foreign_sell, 0),
+        )
 
-        buy_mask = df["action"] == "buy"
-        ohlcv["buy_vol"] = df.loc[buy_mask, "lot"].resample(f"{interval}min").sum()
-        ohlcv["sell_vol"] = df.loc[~buy_mask, "lot"].resample(f"{interval}min").sum()
+        # Single-pass aggregation (from Gemini - more efficient)
+        ohlcv = df.resample(freq).agg({
+            "price": ["first", "max", "min", "last", "count"],
+            "lot": "sum",
+            "value": "sum",
+            "buy_vol": "sum",
+            "sell_vol": "sum",
+            "f_buy": "sum",
+            "f_sell": "sum",
+        })
 
-        f_buy = df["buyer_type"].str.contains("FOREIGN", na=False)
-        f_sell = df["seller_type"].str.contains("FOREIGN", na=False)
-        ohlcv["foreign_buy"] = df.loc[f_buy, "lot"].resample(f"{interval}min").sum()
-        ohlcv["foreign_sell"] = df.loc[f_sell, "lot"].resample(f"{interval}min").sum()
+        # Flatten MultiIndex columns
+        ohlcv.columns = [
+            "open", "high", "low", "close", "trades",
+            "volume", "value", "buy_vol", "sell_vol", "foreign_buy", "foreign_sell"
+        ]
 
-        ohlcv = ohlcv.dropna(subset=["close"]).fillna(0)
+        # Drop empty bars
+        ohlcv = ohlcv.dropna(subset=["close"])  # type: ignore[arg-type]
+        if ohlcv.empty:
+            return pd.DataFrame()
 
-        ohlcv["returns"] = ohlcv["close"].pct_change()
+        # Vectorized feature engineering
+        ohlcv["returns"] = ohlcv["close"].pct_change().fillna(0)
         ohlcv["volatility"] = (ohlcv["high"] - ohlcv["low"]) / (ohlcv["close"] + 1e-8)
         ohlcv["spread"] = ohlcv["high"] - ohlcv["low"]
         ohlcv["buy_pressure"] = ohlcv["buy_vol"] / (ohlcv["volume"] + 1)
         ohlcv["foreign_net"] = ohlcv["foreign_buy"] - ohlcv["foreign_sell"]
         ohlcv["vwap"] = ohlcv["value"] / (ohlcv["volume"] * 100 + 1)
+        ohlcv["momentum"] = ohlcv["close"].pct_change(3).fillna(0)
 
-        ohlcv["momentum"] = ohlcv["close"].pct_change(3)
-        ohlcv["vol_ma"] = ohlcv["volume"].rolling(3, min_periods=1).mean()
-        ohlcv["vol_ratio"] = ohlcv["volume"] / (ohlcv["vol_ma"] + 1)
+        vol_ma = ohlcv["volume"].rolling(3, min_periods=1).mean()
+        ohlcv["vol_ratio"] = ohlcv["volume"] / (vol_ma + 1)
 
         return ohlcv.reset_index()
 
     def load_session(
-        self, symbol: str, session: str, interval: int = 5
+        self, symbol: str, session: str, interval: int = DEFAULT_INTERVAL
     ) -> pd.DataFrame:
         """Load and process a single session from today-running-trade.json."""
         session_path = self.base_path / symbol / session
-        base_date = self.get_session_date(session_path)
+        trt_path = session_path / "today-running-trade.json"
 
-        # Load tick data from today-running-trade.json
-        trt = self.load_json(session_path / "today-running-trade.json")
+        if not trt_path.exists():
+            return pd.DataFrame()
+
+        base_date = self._get_session_date(session_path)
+
+        trt = self._load_json(trt_path)
         if trt and "data" in trt:
             trades = trt["data"].get("running_trade", [])
             if trades:
-                tick_df = self.parse_trades(trades, base_date)
+                tick_df = self._parse_trades_vectorized(trades, base_date)
                 if not tick_df.empty:
-                    return self.aggregate_bars(tick_df, interval)
+                    return self._aggregate_bars(tick_df, interval)
 
         return pd.DataFrame()
 
     def get_symbols(self) -> List[str]:
+        """Get list of available symbols."""
         if not self.base_path.exists():
             return []
         return [d.name for d in self.base_path.iterdir() if d.is_dir()]
 
     def get_sessions(self, symbol: str) -> List[str]:
+        """Get list of available sessions for a symbol."""
         path = self.base_path / symbol
         if not path.exists():
             return []
@@ -247,18 +448,20 @@ class TickToOHLCV:
         return sorted(sessions, key=lambda x: int(x) if x.isdigit() else 0)
 
     def load_group_session(
-        self, symbols: List[str], session: str, interval: int = 5
+        self, symbols: List[str], session: str, interval: int = DEFAULT_INTERVAL
     ) -> pd.DataFrame:
         """Load session data for multiple symbols (for group training)."""
         all_data = []
-        available = self.get_symbols()
+        available = set(self.get_symbols())
 
         for symbol in symbols:
             if symbol not in available:
+                logger.debug(f"Symbol {symbol} not available")
                 continue
 
             sessions = self.get_sessions(symbol)
             if session not in sessions:
+                logger.debug(f"Session {session} not found for {symbol}")
                 continue
 
             try:
@@ -266,9 +469,9 @@ class TickToOHLCV:
                 if not df.empty:
                     df["unique_id"] = symbol
                     all_data.append(df)
-                    print(f"    {symbol}: {len(df)} bars")
+                    logger.info(f"  {symbol}: {len(df)} bars")
             except Exception as e:
-                print(f"    {symbol}: Error - {e}")
+                logger.warning(f"  {symbol}: Error - {e}")
                 continue
 
         if not all_data:
@@ -279,16 +482,30 @@ class TickToOHLCV:
 
 
 class SessionForecaster:
-    """Forecast next trading session."""
+    """Forecast next trading session using neural network ensemble."""
 
-    def __init__(self, interval: int = 5, symbol: str = "STOCK", group: str = None):
+    # Additional ARA/ARB proximity features
+    ARA_ARB_FEATURES: List[str] = [
+        "ara_proximity", "arb_proximity", "pct_to_ara", "pct_to_arb"
+    ]
+
+    def __init__(
+        self,
+        interval: int = DEFAULT_INTERVAL,
+        symbol: str = "STOCK",
+        group: Optional[str] = None
+    ):
         self.interval = interval
         self.symbol = symbol
         self.group = group
-        self.nf = None
+        self.nf: Optional[NeuralForecast] = None
+        self.limits: Optional[ARAARBLimits] = None
 
-        # Use group name for model path if training with group
-        model_name = f"short_group_{group}_{interval}min" if group else f"short_{symbol}_{interval}min"
+        # Model paths
+        model_name = (
+            f"short_group_{group}_{interval}min"
+            if group else f"short_{symbol}_{interval}min"
+        )
         self.model_path = MODELS_DIR / model_name
         self.meta_path = MODELS_DIR / f"{model_name}_meta.json"
 
@@ -437,61 +654,65 @@ class SessionForecaster:
         return nf_df, available, prev_close
 
     def _fill_intraday_gaps(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fill gaps in intraday time series and add available_mask column."""
+        """
+        Fill gaps in intraday time series using reindex (faster than merge).
+        Adapted from Gemini's approach.
+        """
+        df = df.sort_values(["unique_id", "ds"])
         result_dfs = []
 
-        for uid in df["unique_id"].unique():
-            uid_df = df[df["unique_id"] == uid].copy()
-            uid_df = uid_df.sort_values("ds")
-
-            if len(uid_df) < 2:
-                uid_df["available_mask"] = 1.0
-                result_dfs.append(uid_df)
+        for uid, group in df.groupby("unique_id"):
+            if len(group) < 2:
+                group = group.copy()
+                group["available_mask"] = 1.0
+                result_dfs.append(group)
                 continue
 
-            # Create complete time range at the specified interval
-            min_time = uid_df["ds"].min()
-            max_time = uid_df["ds"].max()
+            # Create complete time range using reindex (Gemini's approach)
+            full_idx = pd.date_range(
+                start=group["ds"].min(),
+                end=group["ds"].max(),
+                freq=f"{self.interval}min",
+            )
 
-            # Generate all timestamps at interval frequency
-            all_times = pd.date_range(start=min_time, end=max_time, freq=f"{self.interval}min")
+            # Reindex fills gaps with NaN (cleaner than merge)
+            filled = group.set_index("ds").reindex(full_idx)
+            filled["unique_id"] = uid
 
-            # Create template with all timestamps
-            template = pd.DataFrame({"ds": all_times, "unique_id": uid})
+            # Mark gaps before filling
+            filled["available_mask"] = filled["y"].notna().astype(float)
 
-            # Merge with actual data
-            merged = template.merge(uid_df, on=["ds", "unique_id"], how="left")
+            # Interpolate or ffill/bfill
+            filled["y"] = filled["y"].ffill().bfill()
 
-            # Add available_mask: 1 for real data, 0 for gaps
-            merged["available_mask"] = merged["y"].notna().astype(float)
+            # Fill remaining numeric columns
+            numeric_cols = filled.select_dtypes(include=np.number).columns
+            for col in numeric_cols:
+                if col not in ["available_mask"]:
+                    filled[col] = filled[col].ffill().bfill().fillna(0)
 
-            # Fill gaps with forward fill then backward fill
-            merged["y"] = merged["y"].ffill().bfill()
-
-            # Fill other numeric columns
-            for col in merged.columns:
-                if col not in ["ds", "unique_id", "available_mask"] and merged[col].dtype in ["float64", "int64"]:
-                    merged[col] = merged[col].ffill().bfill().fillna(0)
-
-            result_dfs.append(merged)
+            result_dfs.append(filled.reset_index().rename(columns={"index": "ds"}))
 
         if result_dfs:
             result = pd.concat(result_dfs, ignore_index=True)
-            gap_count = (result["available_mask"] == 0).sum()
+            gap_count = int((result["available_mask"] == 0).sum())
             if gap_count > 0:
-                print(f"  Filled {gap_count} gaps in intraday data (marked with available_mask=0)")
+                logger.info(f"  Filled {gap_count} gaps (marked with available_mask=0)")
             return result
 
         return df
 
     def forecast(
-        self, df: pd.DataFrame, hours: float, target_session: str = None, force_retrain: bool = False
+        self, df: pd.DataFrame, hours: float, target_session: Optional[str] = None, force_retrain: bool = False
     ) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
         """Train and forecast for specified hours. Supports incremental training."""
         nf_df, exog, prev_close = self.prepare_data(df)
         n = len(nf_df)
 
         horizon = self.calculate_horizon(hours)
+
+        # Store limits for later access
+        self.limits = ARAARBLimits(prev_close=prev_close, ara=self.ara_limit, arb=self.arb_limit)
 
         print(f"\n{'=' * 60}")
         print("INPUT DATA")
@@ -505,8 +726,8 @@ class SessionForecaster:
 
         # Show ARA/ARB limits
         print(f"\n  ARA/ARB Limits (based on prev close {prev_close:,.0f}):")
-        print(f"    ARA (Upper): {self.ara_limit:,.0f} (+{(self.ara_limit/prev_close-1)*100:.1f}%)")
-        print(f"    ARB (Lower): {self.arb_limit:,.0f} (-{(1-self.arb_limit/prev_close)*100:.1f}%)")
+        print(f"    ARA (Upper): {self.limits.ara:,.0f} (+{self.limits.ara_pct:.1f}%)")
+        print(f"    ARB (Lower): {self.limits.arb:,.0f} (-{self.limits.arb_pct:.1f}%)")
 
         print(f"\n{'=' * 60}")
         print("FORECAST CONFIG")
@@ -516,18 +737,17 @@ class SessionForecaster:
         print(f"  Forecast bars: {horizon}")
 
         if target_session:
-            sess = MARKET_SESSIONS.get(target_session, {})
-            print(
-                f"  Target session: {target_session.upper()} ({sess.get('start', '?')} - {sess.get('end', '?')})"
-            )
+            sess = MARKET_SESSIONS.get(target_session)
+            if sess:
+                print(f"  Target session: {target_session.upper()} ({sess.start} - {sess.end})")
 
-        if n < 5:
-            raise ValueError(f"Need at least 5 historical bars (have {n})")
+        if n < MIN_BARS_REQUIRED:
+            raise InsufficientDataError(n, MIN_BARS_REQUIRED)
 
         # Adjust horizon if very limited data
         max_h = n * 2  # Allow forecasting up to 2x the input data
         if horizon > max_h:
-            print(f"  Note: Limiting horizon from {horizon} to {max_h} bars")
+            logger.warning(f"  Limiting horizon from {horizon} to {max_h} bars")
             horizon = max_h
 
         input_size = min(n - 1, 12)
@@ -539,7 +759,7 @@ class SessionForecaster:
         session_date = nf_df['ds'].iloc[0].strftime('%Y-%m-%d') if hasattr(nf_df['ds'].iloc[0], 'strftime') else str(nf_df['ds'].iloc[0])[:10]
         saved_meta = None if force_retrain else self.load_model()
         use_fine_tuning = False
-        max_steps = 200
+        max_steps = MAX_TRAINING_STEPS
 
         if saved_meta is not None:
             prev_count = saved_meta.get("data_count", 0)
@@ -547,33 +767,39 @@ class SessionForecaster:
 
             if new_data > 0:
                 print(f"\n  New data detected: {new_data} bars ({prev_count} -> {n})")
-                print(f"  Strategy: Fine-tuning with reduced steps")
+                print("  Strategy: Fine-tuning with reduced steps")
                 use_fine_tuning = True
-                max_steps = 50  # Reduced steps for fine-tuning
+                max_steps = FINE_TUNE_STEPS
             elif new_data == 0:
-                print(f"\n  No new data. Using saved model directly.")
-                print(f"\nGenerating {horizon} bars ({hours} hours) using cached model...")
+                print("\n  No new data. Using saved model directly.")
+                logger.info(f"Generating {horizon} bars ({hours} hours) using cached model...")
 
                 # Predict only for requested symbol if using group training
+                assert self.nf is not None, "Model should be loaded"
                 if self.group and self.symbol:
                     symbol_df = nf_df[nf_df["unique_id"] == self.symbol].copy()
                     if not symbol_df.empty:
-                        forecasts = self.nf.predict(df=symbol_df)
-                        last_date = symbol_df["ds"].iloc[-1]
+                        forecasts = pd.DataFrame(self.nf.predict(df=symbol_df))
+                        ds_col: pd.Series = symbol_df["ds"]  # type: ignore[assignment]
+                        last_date = ds_col.iloc[-1]
                     else:
-                        forecasts = self.nf.predict()
-                        last_date = nf_df["ds"].iloc[-1]
+                        forecasts = pd.DataFrame(self.nf.predict())
+                        ds_col = nf_df["ds"]  # type: ignore[assignment]
+                        last_date = ds_col.iloc[-1]
                 else:
-                    forecasts = self.nf.predict()
-                    last_date = nf_df["ds"].iloc[-1]
+                    forecasts = pd.DataFrame(self.nf.predict())
+                    ds_col = nf_df["ds"]  # type: ignore[assignment]
+                    last_date = ds_col.iloc[-1]
 
                 # Skip to timestamp generation below
-                next_day = last_date + timedelta(days=1)
+                next_day = last_date + timedelta(days=1)  # type: ignore[operator]
                 if target_session:
-                    sess = MARKET_SESSIONS.get(target_session, {})
-                    start_time = sess.get("start", "09:00")
-                    h, m = map(int, start_time.split(":"))
-                    start_dt = next_day.replace(hour=h, minute=m, second=0)
+                    sess = MARKET_SESSIONS.get(target_session)
+                    if sess:
+                        h, m = map(int, sess.start.split(":"))
+                        start_dt = next_day.replace(hour=h, minute=m, second=0)
+                    else:
+                        start_dt = next_day.replace(hour=9, minute=0, second=0)
                 else:
                     start_dt = next_day.replace(hour=9, minute=0, second=0)
                 future_times = [start_dt + timedelta(minutes=i * self.interval) for i in range(len(forecasts))]
@@ -591,11 +817,11 @@ class SessionForecaster:
                 }
                 return forecasts, nf_df, meta
             else:
-                print(f"\n  Data reduced. Retraining from scratch.")
+                print("\n  Data reduced. Retraining from scratch.")
                 saved_meta = None
 
         if saved_meta is None:
-            print(f"\n  Strategy: Training from scratch (no saved model)")
+            print("\n  Strategy: Training from scratch (no saved model)")
 
         # Use HuberLoss for robustness to outliers (price gaps, big moves)
         # Use DistributionLoss with StudentT for probabilistic forecasts
@@ -606,8 +832,8 @@ class SessionForecaster:
                 input_size=input_size,
                 max_steps=max_steps,
                 scaler_type="robust",
-                loss=HuberLoss(),
-                random_seed=42,
+                loss=HuberLoss(),  # type: ignore[arg-type]
+                random_seed=RANDOM_SEED,
             ),
             # NHITS with StudentT distribution - probabilistic forecasts with heavy tails
             NHITS(
@@ -615,8 +841,8 @@ class SessionForecaster:
                 input_size=input_size,
                 max_steps=max_steps,
                 scaler_type="robust",
-                loss=DistributionLoss(distribution="StudentT", level=[80, 90]),
-                random_seed=42,
+                loss=DistributionLoss(distribution="StudentT", level=[80, 90]),  # type: ignore[arg-type]
+                random_seed=RANDOM_SEED,
             ),
             # LSTM with HuberLoss - robust sequential model
             LSTM(
@@ -624,8 +850,8 @@ class SessionForecaster:
                 input_size=input_size,
                 max_steps=max_steps,
                 scaler_type="robust",
-                loss=HuberLoss(),
-                random_seed=42,
+                loss=HuberLoss(),  # type: ignore[arg-type]
+                random_seed=RANDOM_SEED,
             ),
         ]
 
@@ -645,31 +871,36 @@ class SessionForecaster:
 
         # Predict - only for requested symbol if using group training
         print(f"Forecasting {horizon} bars ({hours} hours)...")
+        assert self.nf is not None, "Model should be fitted"
         if self.group and self.symbol:
             symbol_df = nf_df[nf_df["unique_id"] == self.symbol].copy()
             if not symbol_df.empty:
-                forecasts = self.nf.predict(df=symbol_df)
+                forecasts = pd.DataFrame(self.nf.predict(df=symbol_df))
                 print(f"  Predicting for {self.symbol} only")
             else:
                 print(f"  Warning: {self.symbol} not found in group data, predicting all")
-                forecasts = self.nf.predict()
+                forecasts = pd.DataFrame(self.nf.predict())
         else:
-            forecasts = self.nf.predict()
+            forecasts = pd.DataFrame(self.nf.predict())
 
         # Generate future timestamps starting from next trading day 09:00
         # Get the last date for the target symbol
         if self.group and self.symbol and "unique_id" in nf_df.columns:
             symbol_data = nf_df[nf_df["unique_id"] == self.symbol]
-            last_date = symbol_data["ds"].iloc[-1] if not symbol_data.empty else nf_df["ds"].iloc[-1]
+            ds_series: pd.Series = symbol_data["ds"] if not symbol_data.empty else nf_df["ds"]  # type: ignore[assignment]
+            last_date = ds_series.iloc[-1]
         else:
-            last_date = nf_df["ds"].iloc[-1]
-        next_day = last_date + timedelta(days=1)
+            ds_series = nf_df["ds"]  # type: ignore[assignment]
+            last_date = ds_series.iloc[-1]
+        next_day = last_date + timedelta(days=1)  # type: ignore[operator]
 
         if target_session:
-            sess = MARKET_SESSIONS.get(target_session, {})
-            start_time = sess.get("start", "09:00")
-            h, m = map(int, start_time.split(":"))
-            start_dt = next_day.replace(hour=h, minute=m, second=0)
+            sess = MARKET_SESSIONS.get(target_session)
+            if sess:
+                h, m = map(int, sess.start.split(":"))
+                start_dt = next_day.replace(hour=h, minute=m, second=0)
+            else:
+                start_dt = next_day.replace(hour=9, minute=0, second=0)
         else:
             start_dt = next_day.replace(hour=9, minute=0, second=0)
 
@@ -713,15 +944,14 @@ class SessionForecaster:
         return forecasts, nf_df, meta
 
 
-def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, meta: dict):
+def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, meta: dict) -> None:
     """Print forecast results with ARA/ARB limits."""
     print(f"\n{'=' * 70}")
     print(f"FORECAST: {symbol}")
     if meta.get("target_session"):
-        sess = MARKET_SESSIONS.get(meta["target_session"], {})
-        print(
-            f"Target: {meta['target_session'].upper()} ({sess.get('start')}-{sess.get('end')})"
-        )
+        sess = MARKET_SESSIONS.get(meta["target_session"])
+        if sess:
+            print(f"Target: {meta['target_session'].upper()} ({sess.start}-{sess.end})")
     print(
         f"Period: {meta['forecast_start'].strftime('%Y-%m-%d %H:%M')} to {meta['forecast_end'].strftime('%H:%M')}"
     )
@@ -783,7 +1013,7 @@ def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, meta:
         fc = forecasts[price_col]
 
         if "ensemble_clamped" in forecasts.columns:
-            print(f"\n  Clamped to ARA/ARB limits:")
+            print("\n  Clamped to ARA/ARB limits:")
 
         print(
             f"  Open forecast:   {fc.iloc[0]:>14,.0f} ({(fc.iloc[0] / last_price - 1) * 100:+.2f}%)"
@@ -895,9 +1125,10 @@ def plot_forecast(
 
         sess_name = meta.get("target_session", "").upper()
         title = f"{symbol} - Next Day Forecast"
-        if sess_name:
-            sess = MARKET_SESSIONS.get(meta["target_session"], {})
-            title += f" ({sess_name}: {sess.get('start')}-{sess.get('end')})"
+        if sess_name and meta.get("target_session"):
+            sess = MARKET_SESSIONS.get(meta["target_session"])
+            if sess:
+                title += f" ({sess_name}: {sess.start}-{sess.end})"
 
         ax1.set_title(title, fontsize=14, fontweight="bold")
         ax1.set_ylabel("Price")
@@ -934,7 +1165,8 @@ def plot_forecast(
         print("\nMatplotlib not available")
 
 
-def main():
+def main() -> int:
+    """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Forecast Next Trading Session",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -963,7 +1195,7 @@ Examples:
 
     parser.add_argument("symbol", nargs="?", help="Stock symbol")
     parser.add_argument(
-        "--session", "-S", default="1", help="Data session folder (default: 1)"
+        "--session", "-S", default=DEFAULT_SESSION, help=f"Data session folder (default: {DEFAULT_SESSION})"
     )
     parser.add_argument(
         "--session1", action="store_true", help="Forecast session 1 (09:00-12:00 Mon-Thu)"
@@ -973,23 +1205,25 @@ Examples:
     )
     parser.add_argument("--hours", "-H", type=float, help="Forecast duration in hours")
     parser.add_argument(
-        "--interval",
-        "-i",
-        type=int,
-        default=5,
-        help="Bar interval in minutes (default: 5)",
+        "--interval", "-i", type=int, default=DEFAULT_INTERVAL,
+        help=f"Bar interval in minutes (default: {DEFAULT_INTERVAL})",
     )
     parser.add_argument("--no-plot", action="store_true", help="Disable plot generation")
     parser.add_argument("--list", "-l", action="store_true", help="List symbols")
-    parser.add_argument("--source", "-s", default="sources", help="Data directory")
-    parser.add_argument("--retrain", "-r", action="store_true", help="Force retrain from scratch (ignore saved model)")
-    parser.add_argument("--group", "-g", help="Train with symbol group (e.g., 'banking', 'mining'). Edit models/groups.json to define groups.")
+    parser.add_argument("--source", "-s", default=str(SOURCES_DIR), help="Data directory")
+    parser.add_argument("--retrain", "-r", action="store_true", help="Force retrain from scratch")
+    parser.add_argument("--group", "-g", help="Train with symbol group (see models/groups.json)")
     parser.add_argument("--list-groups", action="store_true", help="List available groups")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
 
     # Add watchlist arguments
     add_watchlist_args(parser)
 
     args = parser.parse_args()
+
+    # Configure logging
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
 
     # Validate watchlist arguments
     if hasattr(args, 'watchlist') and args.watchlist:
@@ -997,7 +1231,7 @@ Examples:
             validate_watchlist_args(args)
         except ValueError as e:
             print(f"Error: {e}")
-            sys.exit(1)
+            return 1
 
     loader = TickToOHLCV(args.source)
     groups = load_groups()
@@ -1013,7 +1247,7 @@ Examples:
                 print(f"  {name}: {', '.join(symbols)}")
                 if available:
                     print(f"    (available in sources: {', '.join(available)})")
-        return
+        return 0
 
     if args.list:
         print("Available symbols:")
@@ -1022,46 +1256,42 @@ Examples:
             group = find_group_for_symbol(sym, groups)
             group_str = f" [{group}]" if group else ""
             print(f"  {sym}: sessions {', '.join(sessions)}{group_str}")
-        return
+        return 0
 
     if not args.symbol:
         parser.print_help()
-        sys.exit(1)
+        return 1
 
     symbol = args.symbol.upper()
 
-    if symbol not in loader.get_symbols():
-        print(f"Error: {symbol} not found")
-        print(f"Available: {', '.join(sorted(loader.get_symbols()))}")
-        sys.exit(1)
+    # Validate symbol
+    available_symbols = loader.get_symbols()
+    if symbol not in available_symbols:
+        raise SymbolNotFoundError(symbol, available_symbols)
 
+    # Validate session
     sessions = loader.get_sessions(symbol)
     if args.session not in sessions:
-        print(f"Error: Session {args.session} not found")
-        print(f"Available: {', '.join(sessions)}")
-        sys.exit(1)
+        raise SessionNotFoundError(args.session, sessions)
 
-    # Determine group to use
+    # Validate group
     group_name = args.group
     if group_name and group_name not in groups:
-        print(f"Error: Group '{group_name}' not found")
-        print(f"Available groups: {', '.join(groups.keys())}")
-        print("Edit models/groups.json to add groups.")
-        sys.exit(1)
+        raise GroupNotFoundError(group_name, list(groups.keys()))
 
     # Determine forecast duration
-    target_session = None
+    target_session: Optional[str] = None
     if args.session1:
-        hours = MARKET_SESSIONS["session1"]["hours"]
+        hours = MARKET_SESSIONS["session1"].hours
         target_session = "session1"
     elif args.session2:
-        hours = MARKET_SESSIONS["session2"]["hours"]
+        hours = MARKET_SESSIONS["session2"].hours
         target_session = "session2"
     elif args.hours:
         hours = args.hours
     else:
         # Default: session 1
-        hours = MARKET_SESSIONS["session1"]["hours"]
+        hours = MARKET_SESSIONS["session1"].hours
         target_session = "session1"
 
     print(f"\n{'=' * 70}")
@@ -1073,19 +1303,15 @@ Examples:
     try:
         # Load data based on group or single symbol
         if group_name:
-            print(f"\nLoading group '{group_name}' data from session {args.session}...")
+            logger.info(f"Loading group '{group_name}' data from session {args.session}...")
             ohlcv = loader.load_group_session(groups[group_name], args.session, args.interval)
-            if ohlcv.empty:
-                print("Error: No tick data found for any symbol in group")
-                sys.exit(1)
+            _require_non_empty(ohlcv, "No tick data found for any symbol in group")
             symbols_loaded = ohlcv["unique_id"].nunique()
             print(f"\nLoaded {len(ohlcv)} total bars from {symbols_loaded} symbols")
         else:
-            print(f"\nLoading tick data from session {args.session}...")
+            logger.info(f"Loading tick data from session {args.session}...")
             ohlcv = loader.load_session(symbol, args.session, args.interval)
-            if ohlcv.empty:
-                print("Error: No tick data found")
-                sys.exit(1)
+            _require_non_empty(ohlcv, "No tick data found")
             print(f"Created {len(ohlcv)} bars ({args.interval}-min interval)")
 
         print(f"Total trades: {ohlcv['trades'].sum():,.0f}")
@@ -1094,10 +1320,12 @@ Examples:
         # Get last price for the target symbol
         if group_name and "unique_id" in ohlcv.columns:
             symbol_data = ohlcv[ohlcv["unique_id"] == symbol]
-            last_price = symbol_data["close"].iloc[-1] if not symbol_data.empty else ohlcv["close"].iloc[-1]
+            close_series: pd.Series = symbol_data["close"] if not symbol_data.empty else ohlcv["close"]  # type: ignore[assignment]
+            last_price = _safe_last(close_series)
         else:
             symbol_data = ohlcv
-            last_price = ohlcv["close"].iloc[-1]
+            close_series = ohlcv["close"]  # type: ignore[assignment]
+            last_price = _safe_last(close_series)
 
         forecaster = SessionForecaster(interval=args.interval, symbol=symbol, group=group_name)
         forecasts, historical, meta = forecaster.forecast(ohlcv, hours, target_session, force_retrain=args.retrain)
@@ -1106,35 +1334,28 @@ Examples:
 
         if not args.no_plot:
             # Use symbol-specific data for plots when using group training
-            plot_data = symbol_data if group_name and not symbol_data.empty else ohlcv
+            plot_data: pd.DataFrame = symbol_data if group_name and not symbol_data.empty else ohlcv  # type: ignore[assignment]
             plot_forecast(plot_data, forecasts, symbol, meta)
 
         symbol_csv_dir = CSV_DIR / symbol
         symbol_csv_dir.mkdir(parents=True, exist_ok=True)
         out = symbol_csv_dir / f"short_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         forecasts.to_csv(out, index=False)
-        print(f"\nSaved: {out}")
+        logger.info(f"Saved: {out}")
 
         # Update watchlist if requested
         if args.watchlist:
-            # Determine outlook from forecast
             price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
             if price_col in forecasts.columns:
                 fc = forecasts[price_col]
                 final_forecast = fc.iloc[-1]
                 pct_change = (final_forecast / last_price - 1) * 100
+                outlook = Outlook.from_price_change(last_price, final_forecast)
 
-                if pct_change > 0:
-                    outlook = "BULLISH"
-                elif pct_change < 0:
-                    outlook = "BEARISH"
-                else:
-                    outlook = "NEUTRAL"
-
-                print(f"\nForecast outlook for {symbol}: {outlook} ({pct_change:+.2f}%)")
+                print(f"\nForecast outlook for {symbol}: {outlook.name} ({pct_change:+.2f}%)")
 
                 # Filter based on bullish/bearish flags
-                symbols_with_outlook = [{"symbol": symbol, "outlook": outlook}]
+                symbols_with_outlook = [{"symbol": symbol, "outlook": outlook.name}]
                 symbols_to_add = filter_symbols_by_outlook(
                     symbols_with_outlook,
                     bullish_only=args.bullish,
@@ -1151,18 +1372,22 @@ Examples:
                         )
                         print_watchlist_summary(result)
                     except Exception as e:
-                        print(f"\nWatchlist update failed: {e}")
+                        logger.error(f"Watchlist update failed: {e}")
                 else:
                     filter_type = "bullish" if args.bullish else "bearish" if args.bearish else ""
-                    print(f"\nNo symbols to add to watchlist (outlook is {outlook}, filter: {filter_type})")
+                    print(f"\nNo symbols to add to watchlist (outlook is {outlook.name}, filter: {filter_type})")
 
+        return 0
+
+    except ForecastError as e:
+        print(f"\nError: {e}")
+        return 1
     except Exception as e:
         print(f"\nError: {e}")
         import traceback
-
         traceback.print_exc()
-        sys.exit(1)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
