@@ -44,26 +44,24 @@ import yfinance as yf
 from neuralforecast import NeuralForecast
 from neuralforecast.models import NBEATS, NHITS, LSTM
 
-# Local imports
-from idx_rules import (
-    add_ara_arb_features,
-    clamp_forecast_series,
-    get_daily_limit_info,
-    is_indonesian_stock,
-)
-from watchlist import (
-    add_watchlist_args,
-    filter_symbols_by_outlook,
-    print_watchlist_summary,
-    update_watchlist,
-    validate_watchlist_args,
-)
-
 # Shared utilities
 from modules import (
     CSV_DIR,
     PLOT_DIR,
     setup_logging,
+)
+from modules.idx_rules import (
+    add_ara_arb_features,
+    clamp_forecast_series,
+    get_daily_limit_info,
+    is_indonesian_stock,
+)
+from modules.watchlist import (
+    add_watchlist_args,
+    filter_symbols_by_outlook,
+    print_watchlist_summary,
+    update_watchlist,
+    validate_watchlist_args,
 )
 
 # Suppress warnings

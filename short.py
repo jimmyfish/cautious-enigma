@@ -34,18 +34,6 @@ from neuralforecast import NeuralForecast
 from neuralforecast.losses.pytorch import DistributionLoss, HuberLoss
 from neuralforecast.models import LSTM, NBEATS, NHITS
 
-# IDX ARA/ARB rules
-from idx_rules import calculate_ara_arb
-
-# Watchlist integration
-from watchlist import (
-    add_watchlist_args,
-    filter_symbols_by_outlook,
-    print_watchlist_summary,
-    update_watchlist,
-    validate_watchlist_args,
-)
-
 # Shared utilities
 from modules import (
     MODELS_DIR,
@@ -56,6 +44,14 @@ from modules import (
     setup_logging,
     load_groups,
     find_group_for_symbol,
+)
+from modules.idx_rules import calculate_ara_arb
+from modules.watchlist import (
+    add_watchlist_args,
+    filter_symbols_by_outlook,
+    print_watchlist_summary,
+    update_watchlist,
+    validate_watchlist_args,
 )
 
 # Suppress warnings after imports
