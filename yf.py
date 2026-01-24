@@ -59,6 +59,13 @@ from watchlist import (
     validate_watchlist_args,
 )
 
+# Shared utilities
+from modules import (
+    CSV_DIR,
+    PLOT_DIR,
+    setup_logging,
+)
+
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
@@ -68,14 +75,6 @@ warnings.filterwarnings("ignore")
 
 # Type aliases
 JsonDict: TypeAlias = Dict[str, Any]
-
-# Directories
-CSV_DIR: Final[Path] = Path("csv")
-PLOT_DIR: Final[Path] = Path("plot")
-
-# Create directories
-CSV_DIR.mkdir(exist_ok=True)
-PLOT_DIR.mkdir(exist_ok=True)
 
 # Model configuration
 DEFAULT_HORIZON: Final[int] = 5
@@ -115,27 +114,8 @@ VALID_INTERVALS: Final[Dict[str, IntervalConfig]] = {
 }
 
 
-# =============================================================================
-# Logging Configuration
-# =============================================================================
-
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure and return the application logger."""
-    logger = logging.getLogger("yf_forecast")
-    logger.setLevel(level)
-
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%H:%M:%S"
-        ))
-        logger.addHandler(handler)
-
-    return logger
-
-
-logger = setup_logging()
+# Logger
+logger = setup_logging("yf_forecast")
 
 
 # =============================================================================

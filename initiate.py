@@ -38,6 +38,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 
+# Shared utilities
+from modules import (
+    GROUPS_FILE,
+    SOURCES_DIR,
+    setup_logging,
+    load_groups,
+)
+
 load_dotenv()
 
 Number: TypeAlias = Union[int, float]
@@ -53,46 +61,13 @@ MARKET_DETECTOR_LIMIT: Final[int] = 25
 MARKET_DETECTOR_DAYS: Final[int] = 7
 HOLIDAY_CHECK_DAYS: Final[int] = 7
 
-BASE_DIR: Final[Path] = Path(__file__).parent
-GROUPS_FILE: Final[Path] = BASE_DIR / "models" / "groups.json"
-SOURCES_DIR: Final[Path] = BASE_DIR / "sources"
-
 API_BASE_URL: Final[str] = "https://exodus.stockbit.com"
 
 TELEGRAM_BOT_TOKEN: Final[Optional[str]] = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID: Final[Optional[str]] = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API_URL: Final[str] = "https://api.telegram.org"
 
-class ColoredFormatter(logging.Formatter):
-    COLORS: Dict[int, str] = {
-        logging.DEBUG: "\033[36m",     # Cyan
-        logging.INFO: "\033[32m",      # Green
-        logging.WARNING: "\033[33m",   # Yellow
-        logging.ERROR: "\033[31m",     # Red
-        logging.CRITICAL: "\033[35m",  # Magenta
-    }
-    RESET: str = "\033[0m"
-
-    def format(self, record: logging.LogRecord) -> str:
-        color = self.COLORS.get(record.levelno, "")
-        message = super().format(record)
-        return f"{color}{message}{self.RESET}" if color else message
-
-def setup_logging(level: int = logging.INFO) -> logging.Logger:
-    logger = logging.getLogger("initiate")
-    logger.setLevel(level)
-
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(ColoredFormatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%H:%M:%S"
-        ))
-        logger.addHandler(handler)
-
-    return logger
-
-logger = setup_logging()
+logger = setup_logging("initiate")
 
 _print_lock = threading.Lock()
 
@@ -404,19 +379,6 @@ def save_json_file(path: Path, data: JsonDict, indent: int = 2, atomic: bool = T
         logger.error(f"Failed to save {path}: {e}")
         return False
 
-@lru_cache(maxsize=1)
-def load_groups() -> Dict[str, List[str]]:
-    if not GROUPS_FILE.exists():
-        return {}
-
-    try:
-        with GROUPS_FILE.open("r", encoding="utf-8") as f:
-            groups = json.load(f)
-        groups.pop("_comment", None)
-        return groups
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"Failed to load groups file: {e}")
-        return {}
 
 class SessionDirectory:
     def __init__(self, symbol: str, base_dir: Path = SOURCES_DIR):

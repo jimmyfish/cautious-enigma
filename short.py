@@ -46,23 +46,24 @@ from watchlist import (
     validate_watchlist_args,
 )
 
+# Shared utilities
+from modules import (
+    MODELS_DIR,
+    CSV_DIR,
+    PLOT_DIR,
+    SOURCES_DIR,
+    GROUPS_FILE,
+    setup_logging,
+    load_groups,
+    find_group_for_symbol,
+)
+
 # Suppress warnings after imports
 warnings.filterwarnings("ignore")
 
 # =============================================================================
 # Constants
 # =============================================================================
-
-# Directories
-MODELS_DIR: Final[Path] = Path("models")
-CSV_DIR: Final[Path] = Path("csv")
-PLOT_DIR: Final[Path] = Path("plot")
-SOURCES_DIR: Final[Path] = Path("sources")
-GROUPS_FILE: Final[Path] = MODELS_DIR / "groups.json"
-
-# Create directories
-MODELS_DIR.mkdir(exist_ok=True)
-CSV_DIR.mkdir(exist_ok=True)
 
 # Model configuration
 DEFAULT_INTERVAL: Final[int] = 5  # minutes
@@ -72,28 +73,8 @@ MAX_TRAINING_STEPS: Final[int] = 200
 FINE_TUNE_STEPS: Final[int] = 50
 RANDOM_SEED: Final[int] = 42
 
-
-# =============================================================================
-# Logging Configuration
-# =============================================================================
-
-def _setup_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure and return the application logger."""
-    logger = logging.getLogger("short_forecast")
-    logger.setLevel(level)
-
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%H:%M:%S"
-        ))
-        logger.addHandler(handler)
-
-    return logger
-
-
-logger = _setup_logging()
+# Logger
+logger = setup_logging("short_forecast")
 
 
 # =============================================================================
@@ -223,29 +204,6 @@ def _safe_last(series: pd.Series, default: Any = None) -> Any:
             raise DataError("Cannot read last value from empty series")
         return default
     return series.iloc[-1]
-
-
-def load_groups() -> Dict[str, List[str]]:
-    """Load stock groups from config file."""
-    if not GROUPS_FILE.exists():
-        return {}
-
-    try:
-        with GROUPS_FILE.open("r") as f:
-            groups = json.load(f)
-        return {k: v for k, v in groups.items() if not k.startswith("_")}
-    except (json.JSONDecodeError, IOError) as e:
-        logger.warning(f"Failed to load groups: {e}")
-        return {}
-
-
-def find_group_for_symbol(symbol: str, groups: Dict[str, List[str]]) -> Optional[str]:
-    """Find which group a symbol belongs to."""
-    symbol_upper = symbol.upper()
-    for group_name, symbols in groups.items():
-        if symbol_upper in (s.upper() for s in symbols):
-            return group_name
-    return None
 
 
 class TickToOHLCV:

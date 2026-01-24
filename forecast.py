@@ -43,39 +43,16 @@ from watchlist import (
     validate_watchlist_args,
 )
 
+# Shared utilities
+from modules import (
+    MODELS_DIR,
+    CSV_DIR,
+    GROUPS_FILE,
+    load_groups,
+    find_group_for_symbol,
+)
+
 warnings.filterwarnings("ignore")
-
-# Model persistence directory
-MODELS_DIR = Path("models")
-MODELS_DIR.mkdir(exist_ok=True)
-
-# CSV output directory
-CSV_DIR = Path("csv")
-CSV_DIR.mkdir(exist_ok=True)
-
-# Groups config file
-GROUPS_FILE = MODELS_DIR / "groups.json"
-
-
-def load_groups() -> Dict[str, List[str]]:
-    """Load stock groups from config file."""
-    if not GROUPS_FILE.exists():
-        return {}
-    try:
-        with open(GROUPS_FILE, "r") as f:
-            groups = json.load(f)
-        # Remove comments
-        return {k: v for k, v in groups.items() if not k.startswith("_")}
-    except (json.JSONDecodeError, IOError):
-        return {}
-
-
-def find_group_for_symbol(symbol: str, groups: Dict[str, List[str]]) -> Optional[str]:
-    """Find which group a symbol belongs to."""
-    for group_name, symbols in groups.items():
-        if symbol.upper() in [s.upper() for s in symbols]:
-            return group_name
-    return None
 
 
 class MarketAlphaEngine:
