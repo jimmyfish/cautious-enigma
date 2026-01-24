@@ -40,6 +40,21 @@ This is a command-line Python application with script-based workflows. It follow
   - Poisson - For count data (volume forecasting)
   - NegativeBinomial - Overdispersed count data
 
+### IDX Rules Module
+
+- **idx_rules.py** - Indonesian Stock Exchange price limit rules
+  - ARA (Auto Rejection Atas) - Upper daily price limit
+  - ARB (Auto Rejection Bawah) - Lower daily price limit
+  - Tick size calculation based on price bands
+  - Automatic forecast clamping to valid price ranges
+
+### Watchlist Integration
+
+- **watchlist.py** - Stockbit watchlist API integration
+  - Add/remove symbols from watchlists
+  - Filter by bullish/bearish outlook
+  - Clear or append to existing watchlists
+
 ## External APIs
 
 - **Stockbit Exodus API** (`exodus.stockbit.com`) - Primary data source
@@ -124,6 +139,15 @@ python cross.py ICBP --source tick         # CV on tick data
 python cross.py AAPL --source yfinance     # CV on Yahoo Finance data
 python cross.py ICBP --n-windows 5         # 5-fold CV
 
+# Watchlist integration (requires -wid watchlist ID)
+python forecast.py BBRI -w -wid 123456     # Add to watchlist after forecast
+python forecast.py BBRI -w -wid 123456 -bl # Add only if bullish
+python forecast.py BBRI -w -wid 123456 -br # Add only if bearish
+python forecast.py BBRI -w -wid 123456 --keep  # Keep existing items
+
+python short.py ICBP --session1 -w -wid 123456  # Intraday + watchlist
+python yf.py AAPL,GOOGL -w -wid 123456 -bl      # Multiple symbols, bullish only
+
 # List available options
 python forecast.py --list                  # List symbols
 python forecast.py --list-groups           # List stock groups
@@ -155,6 +179,7 @@ python initiate.py --list-sectors          # List available groups
 
 ### Output Files
 
-- `forecast_{SYMBOL}_{timestamp}.csv` - Daily forecast results
-- `short_{SYMBOL}_{timestamp}.csv` - Intraday forecast results
-- `plot/` - Generated charts (PNG)
+- `csv/{SYMBOL}/forecast_{timestamp}.csv` - Daily forecast results
+- `csv/{SYMBOL}/short_{timestamp}.csv` - Intraday forecast results
+- `csv/{SYMBOL}/yf_{timestamp}.csv` - Yahoo Finance forecast results
+- `plot/{SYMBOL}/` - Generated charts (PNG)

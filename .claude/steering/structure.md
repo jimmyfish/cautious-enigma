@@ -11,12 +11,15 @@ helpme/
 ├── short.py              # Intraday session forecasting
 ├── yf.py                 # Yahoo Finance data forecasting
 ├── cross.py              # Cross-validation for model evaluation
+├── idx_rules.py          # IDX ARA/ARB price limit rules
+├── watchlist.py          # Stockbit watchlist API integration
 ├── scripts/
 │   └── analyze_market.py # Analytics pipeline
 ├── sources/              # Data storage directory
 ├── models/               # Saved models and config
 │   └── groups.json       # Stock group definitions (18+ sectors)
-├── plot/                 # Generated charts
+├── csv/                  # Forecast CSV outputs (organized by symbol)
+├── plot/                 # Generated charts (organized by symbol)
 ├── requirements.txt      # Python dependencies
 ├── .env                  # Environment variables (gitignored)
 └── .claude/
@@ -30,10 +33,12 @@ helpme/
 | `screener.py` | Fetch stock screener results | `python screener.py [TEMPLATE_ID]` |
 | `initiate.py` | Collect market data for a symbol/group | `python initiate.py {SYMBOL}` or `-g {group}` |
 | `analyze_bsjp.py` | Full bulk analysis workflow | `python analyze_bsjp.py` |
-| `forecast.py` | Daily price forecasting | `python forecast.py {SYMBOL} [--horizon N]` |
+| `forecast.py` | Daily price forecasting | `python forecast.py {SYMBOL} [--horizon N] [-w -wid ID]` |
 | `short.py` | Intraday session forecasting | `python short.py {SYMBOL} --session1/--session2` |
 | `yf.py` | Yahoo Finance forecasting | `python yf.py {SYMBOL} [--interval 1h]` |
 | `cross.py` | Model cross-validation | `python cross.py {SYMBOL} --source tick/yfinance` |
+| `idx_rules.py` | IDX ARA/ARB utilities (module) | `from idx_rules import calculate_ara_arb` |
+| `watchlist.py` | Stockbit watchlist API (module) | `from watchlist import update_watchlist` |
 | `scripts/analyze_market.py` | Generate analytics JSON | `python scripts/analyze_market.py {SYMBOL} {SESSION}` |
 
 ## Data Directory Structure
@@ -95,9 +100,30 @@ The historical price feed contains rich daily data:
 - **Pagination**: Max 50 items per page, use `page=2` for more
 - **Foreign data**: Per-day foreign_buy, foreign_sell, net_foreign included
 
+## CSV Output Structure
+
+```
+csv/
+├── {SYMBOL}/                # e.g., BBRI, AAPL
+│   ├── forecast_{timestamp}.csv    # Daily forecast results
+│   ├── short_{timestamp}.csv       # Intraday forecast results
+│   └── yf_{timestamp}.csv          # Yahoo Finance forecast results
+```
+
+## Plot Output Structure
+
+```
+plot/
+├── {SYMBOL}/                # e.g., BBRI, AAPL
+│   ├── forecast_{timestamp}.png    # Daily forecast charts
+│   ├── short_{timestamp}.png       # Intraday forecast charts
+│   └── yf_{timestamp}.png          # Yahoo Finance forecast charts
+```
+
 ## Code Organization Patterns
 
 - **Single-file scripts** - Each entry point is self-contained
+- **Shared modules** - `idx_rules.py` and `watchlist.py` are imported by forecasting scripts
 - **Utility functions** - Helper functions defined at top of each script
 - **Pipeline pattern** - Data flows through collection, analysis, and reporting stages
 - **JSON-based data interchange** - All intermediate data stored as JSON
@@ -112,6 +138,8 @@ The historical price feed contains rich daily data:
 6. **Connection pooling** - `requests.Session()` reuses TCP connections for efficiency
 7. **Symbol deduplication** - Symbols appearing in multiple groups are processed only once
 8. **Efficient session counting** - `.last_session` file avoids full directory scans
+9. **ARA/ARB compliance** - All forecasts for Indonesian stocks are clamped to valid daily price limits
+10. **Watchlist integration** - Forecast scripts can push results to Stockbit watchlists via `-w` flag
 
 ## initiate.py Architecture
 

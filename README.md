@@ -16,6 +16,8 @@ A command-line toolkit for analyzing Indonesian Stock Exchange (IDX) stocks. Pro
 - **Cross-Validation** - Evaluate model accuracy with time-series CV (MAE, RMSE, MAPE, direction accuracy)
 - **Group Training** - Train models on 18+ IDX sectors (banking, energy, technology, etc.)
 - **Model Persistence** - Save and resume training with checkpoint support for incremental learning
+- **ARA/ARB Price Limits** - Automatic enforcement of IDX daily price limits on all forecasts
+- **Watchlist Integration** - Push forecast results to Stockbit watchlists with bullish/bearish filtering
 - **Telegram Notifications** - Optional bot integration for automated alerts
 
 ## Setup
@@ -129,9 +131,15 @@ python forecast.py BBRI --retrain
 # List available symbols and groups
 python forecast.py --list
 python forecast.py --list-groups
+
+# Update watchlist after forecast
+python forecast.py BBRI -w -wid 123456           # Add to watchlist
+python forecast.py BBRI -w -wid 123456 -bl       # Add only if bullish
+python forecast.py BBRI -w -wid 123456 -br       # Add only if bearish
+python forecast.py BBRI -w -wid 123456 --keep    # Keep existing items
 ```
 
-Output: `forecast_BBRI_{timestamp}.csv` with predictions and confidence intervals
+Output: `csv/BBRI/forecast_{timestamp}.csv` with predictions and confidence intervals
 
 ### Intraday Forecasting
 
@@ -150,9 +158,12 @@ python short.py BBCA --group banking --session1
 
 # Disable auto-plot
 python short.py ICBP --session1 --no-plot
+
+# With watchlist update
+python short.py ICBP --session1 -w -wid 123456 -bl
 ```
 
-Output: `short_ICBP_{timestamp}.csv` with intraday predictions
+Output: `csv/ICBP/short_{timestamp}.csv` with intraday predictions
 
 ### Yahoo Finance Forecasting
 
@@ -173,9 +184,12 @@ python yf.py AAPL --interval 1h --period 5d --horizon 24
 
 # Disable auto-plot
 python yf.py AAPL --no-plot
+
+# With watchlist update (multiple symbols, bullish only)
+python yf.py BBRI.JK,BBCA.JK -w -wid 123456 -bl
 ```
 
-Output: `yf_{SYMBOL}_{timestamp}.csv` with predictions and charts in `plot/`
+Output: `csv/{SYMBOL}/yf_{timestamp}.csv` with predictions and charts in `plot/{SYMBOL}/`
 
 ### Cross-Validation
 
@@ -241,6 +255,8 @@ helpme/
 ├── short.py              # Intraday session forecasting
 ├── yf.py                 # Yahoo Finance data forecasting
 ├── cross.py              # Cross-validation for model evaluation
+├── idx_rules.py          # IDX ARA/ARB price limit rules
+├── watchlist.py          # Stockbit watchlist API integration
 ├── scripts/
 │   └── analyze_market.py # Analytics pipeline
 ├── sources/              # Data storage
@@ -252,7 +268,10 @@ helpme/
 │   ├── forecast_{SYMBOL}/    # Daily forecast models
 │   ├── short_{SYMBOL}_{interval}min/  # Intraday models
 │   └── group_{name}/     # Group-trained models
+├── csv/                  # Forecast CSV outputs
+│   └── {SYMBOL}/         # Organized by symbol
 ├── plot/                 # Generated charts
+│   └── {SYMBOL}/         # Organized by symbol
 ├── requirements.txt
 ├── .env                  # API credentials (not in git)
 └── README.md
@@ -311,6 +330,7 @@ The forecasting tools use **NeuralForecast** with these neural network architect
 - **Gap Handling**: Missing dates/bars are automatically filled with `available_mask` so models can handle incomplete data.
 - **Group Training**: Train on multiple related stocks (e.g., all banking stocks) to learn common patterns.
 - **Robust Loss Functions**: HuberLoss handles price outliers (gaps, big moves). StudentT distribution handles heavy tails.
+- **ARA/ARB Compliance**: All forecasts for Indonesian stocks are automatically clamped to valid daily price limits.
 
 ### Alpha Features Used
 
@@ -321,6 +341,51 @@ The models learn from these market signals:
 - **Foreign Flow** - Net foreign transaction value
 - **Volatility** - Intraday price range
 - **AccDist Signal** - Accumulation/distribution patterns
+- **ARA/ARB Proximity** - Distance to daily price limits (Indonesian stocks only)
+
+## ARA/ARB Price Limits
+
+Indonesian stocks have daily price limits enforced by IDX:
+
+| Price Range | ARA (Upper) | ARB (Lower) |
+|-------------|-------------|-------------|
+| < 50 IDR | +35% | -35% |
+| 50-200 IDR | +35% | -35% |
+| 200-5000 IDR | +25% | -25% |
+| > 5000 IDR | +20% | -20% |
+
+All forecasts for Indonesian stocks (local sources and `.JK` symbols on Yahoo Finance) are automatically clamped to these limits. The `idx_rules.py` module provides:
+
+- `calculate_ara_arb(prev_close)` - Get ARA/ARB prices for a trading day
+- `clamp_forecast_series(forecasts, last_price)` - Clamp multi-day forecasts
+- `add_ara_arb_features(df)` - Add proximity features for model training
+
+## Watchlist Integration
+
+Push forecast results directly to Stockbit watchlists:
+
+```bash
+# Add to watchlist after forecast
+python forecast.py BBRI -w -wid 123456
+
+# Filter by outlook
+python forecast.py BBRI -w -wid 123456 -bl    # Only bullish
+python forecast.py BBRI -w -wid 123456 -br    # Only bearish
+
+# Keep existing items (default: purge and replace)
+python forecast.py BBRI -w -wid 123456 --keep
+
+# Multiple symbols with filter
+python yf.py BBRI.JK,BBCA.JK,BMRI.JK -w -wid 123456 -bl
+```
+
+| Flag | Description |
+|------|-------------|
+| `-w, --watchlist` | Enable watchlist update |
+| `-wid, --watchlist-id` | Watchlist ID (required with `-w`) |
+| `-bl, --bullish` | Only add bullish symbols |
+| `-br, --bearish` | Only add bearish symbols |
+| `--keep` | Keep existing items (default: purge first) |
 
 ## License
 

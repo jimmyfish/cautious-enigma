@@ -18,6 +18,8 @@
 - **Cross-Validation**: Time-series cross-validation to evaluate model accuracy before deployment (MAE, RMSE, MAPE, direction accuracy)
 - **Group Training**: Train models on related stocks (18+ IDX sectors including banking, energy, technology, property, etc.) to learn common market patterns
 - **Incremental Learning**: Model persistence with warm-start training - saves checkpoints and fine-tunes on new data instead of retraining from scratch
+- **ARA/ARB Price Limits**: Automatic enforcement of IDX daily price limits (Auto Rejection Atas/Bawah) on all forecasts for Indonesian stocks
+- **Watchlist Integration**: Push forecast results directly to Stockbit watchlists with bullish/bearish filtering
 - **Telegram Notifications**: Optional Telegram bot integration for automated alerts
 
 ## Target Use Case
@@ -38,3 +40,5 @@
 - **Incremental training** - models improve over time without full retraining
 - **Robust to market anomalies** - HuberLoss and StudentT distribution handle outliers, gaps, and extreme moves
 - **Sector-aware forecasting** - group training captures common patterns across related stocks
+- **Regulatory compliance** - forecasts automatically respect IDX ARA/ARB daily price limits
+- **Watchlist automation** - push bullish/bearish symbols directly to Stockbit watchlists for monitoring
