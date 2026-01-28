@@ -63,6 +63,12 @@ from modules.watchlist import (
     update_watchlist,
     validate_watchlist_args,
 )
+from modules.telegram import (
+    add_telegram_args,
+    send_batch_notification,
+    send_forecast_notification,
+    validate_telegram_args,
+)
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -764,7 +770,8 @@ class ForecastPlotter:
         df: pd.DataFrame,
         forecasts: pd.DataFrame,
         symbol: str,
-        name: str
+        name: str,
+        last_price: float = 0.0
     ) -> Optional[Path]:
         """
         Plot historical prices and forecast.
@@ -774,6 +781,7 @@ class ForecastPlotter:
             forecasts: Forecast data
             symbol: Stock symbol
             name: Company name
+            last_price: Last known price for calculating change %
 
         Returns:
             Path to saved plot, or None if plotting failed
@@ -796,7 +804,14 @@ class ForecastPlotter:
             # RSI chart
             ForecastPlotter._plot_rsi(axes[2], df)
 
+            # Add forecast table as text annotation
+            if last_price > 0:
+                ForecastPlotter._add_forecast_table(fig, forecasts, last_price, symbol)
+
             plt.tight_layout()
+
+            # Adjust layout to make room for the text box
+            plt.subplots_adjust(right=0.75)
 
             # Save plot
             dir_name = symbol.replace(".JK", "")
@@ -816,6 +831,68 @@ class ForecastPlotter:
         except Exception as e:
             logger.error(f"Plot generation failed: {e}")
             return None
+
+    @staticmethod
+    def _add_forecast_table(fig, forecasts: pd.DataFrame, last_price: float, symbol: str) -> None:
+        """Add forecast table as text annotation on the right side of the plot."""
+        show_clamped = "ensemble_clamped" in forecasts.columns
+        is_indonesian = symbol.endswith(".JK")
+
+        lines = []
+        lines.append("FORECAST TABLE")
+        lines.append("-" * 35)
+
+        # Show ARA/ARB limits for Indonesian stocks
+        if is_indonesian:
+            limit_info = get_daily_limit_info(last_price)
+            lines.append(f"ARA/ARB (Day 1, {last_price:,.0f}):")
+            lines.append(f"  ARA: {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)")
+            lines.append(f"  ARB: {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)")
+            lines.append("")
+
+        # Table header
+        if show_clamped:
+            lines.append(f"{'Date':<10} {'Clamp':>8} {'Chg':>7}")
+        else:
+            lines.append(f"{'Date':<10} {'Fcst':>8} {'Chg':>7}")
+        lines.append("-" * 27)
+
+        # Table rows
+        for _, row in forecasts.iterrows():
+            d = row["ds"]
+            if hasattr(d, "strftime"):
+                date_str = d.strftime("%m-%d")
+            else:
+                date_str = str(d)[5:10]
+
+            if show_clamped:
+                val = row.get("ensemble_clamped", row.get("ensemble", 0)) or 0
+            else:
+                val = row.get("ensemble", 0) or 0
+
+            pct = (val / last_price - 1) * 100
+            lines.append(f"{date_str:<10} {val:>8,.0f} {pct:>+6.1f}%")
+
+        # Summary
+        lines.append("-" * 27)
+        price_col = "ensemble_clamped" if show_clamped else "ensemble"
+        if price_col in forecasts.columns:
+            fc = forecasts[price_col]
+            final = fc.iloc[-1]
+            pct_change = (final / last_price - 1) * 100
+            outlook = "BULL" if pct_change > 2 else "BEAR" if pct_change < -2 else "NEUT"
+            lines.append(f"Final: {final:,.0f} ({pct_change:+.1f}%)")
+            lines.append(f"Outlook: {outlook}")
+
+        # Join lines and add to figure
+        text = "\n".join(lines)
+        fig.text(
+            0.78, 0.5, text,
+            fontsize=8,
+            fontfamily="monospace",
+            verticalalignment="center",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow", alpha=0.9)
+        )
 
     @staticmethod
     def _plot_price(ax, df: pd.DataFrame, forecasts: pd.DataFrame, symbol: str, name: str) -> None:
@@ -967,11 +1044,15 @@ class SymbolProcessor:
         # Generate plot
         plot_path = None
         if self.plot:
-            plot_path = ForecastPlotter.plot(df, forecasts, symbol, loader.name)
+            plot_path = ForecastPlotter.plot(df, forecasts, symbol, loader.name, last_price)
 
-        # Save CSV
-        csv_path = self._save_csv(forecasts, symbol)
+        # Save CSV with Change % column
+        csv_path = self._save_csv(forecasts, symbol, last_price)
         logger.info(f"Saved: {csv_path}")
+
+        # Save formatted summary text file
+        txt_path = self._save_summary_txt(forecasts, symbol, last_price, loader.currency)
+        logger.info(f"Saved: {txt_path}")
 
         # Calculate summary
         summary_close: pd.Series = df["close"]  # type: ignore[assignment]
@@ -1000,14 +1081,110 @@ class SymbolProcessor:
             plot_path=plot_path,
         )
 
-    def _save_csv(self, forecasts: pd.DataFrame, symbol: str) -> Path:
-        """Save forecasts to CSV."""
+    def _save_csv(self, forecasts: pd.DataFrame, symbol: str, last_price: float) -> Path:
+        """Save forecasts to CSV with Change % column."""
         dir_name = symbol.replace(".JK", "")
         symbol_csv_dir = CSV_DIR / dir_name
         symbol_csv_dir.mkdir(parents=True, exist_ok=True)
 
+        # Add Change % column
+        df_to_save = forecasts.copy()
+        price_col = "ensemble_clamped" if "ensemble_clamped" in df_to_save.columns else "ensemble"
+        if price_col in df_to_save.columns:
+            df_to_save["change_pct"] = (df_to_save[price_col] / last_price - 1) * 100
+
         out_path = symbol_csv_dir / f"yf_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        forecasts.to_csv(out_path, index=False)
+        df_to_save.to_csv(out_path, index=False)
+
+        return out_path
+
+    def _save_summary_txt(
+        self, forecasts: pd.DataFrame, symbol: str, last_price: float, currency: str
+    ) -> Path:
+        """Save formatted forecast table to text file."""
+        dir_name = symbol.replace(".JK", "")
+        symbol_csv_dir = CSV_DIR / dir_name
+        symbol_csv_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = symbol_csv_dir / f"yf_{datetime.now().strftime('%Y%m%d_%H%M%S')}_summary.txt"
+
+        lines = []
+        lines.append("=" * 70)
+        lines.append(f"FORECAST: {symbol}")
+        lines.append("=" * 70)
+
+        is_indonesian = symbol.endswith(".JK")
+        show_clamped = "ensemble_clamped" in forecasts.columns
+
+        # Show ARA/ARB limits for Indonesian stocks
+        if is_indonesian:
+            limit_info = get_daily_limit_info(last_price)
+            lines.append(f"\nARA/ARB Limits (Day 1 based on {last_price:,.0f} IDR):")
+            lines.append(f"  ARA (Upper): {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)")
+            lines.append(f"  ARB (Lower): {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)")
+
+        # Table header
+        if show_clamped:
+            lines.append(f"\n{'Date':<12}{'Forecast':>12}{'Clamped':>12}{'ARA':>10}{'ARB':>10}{'Change':>10}")
+            lines.append("-" * 66)
+        else:
+            lines.append(f"\n{'Date':<12}{'Forecast':>12}{'Low':>12}{'High':>12}{'Change':>10}")
+            lines.append("-" * 58)
+
+        # Table rows
+        for _, row in forecasts.iterrows():
+            d = row["ds"]
+            if hasattr(d, "strftime"):
+                date_str = d.strftime("%Y-%m-%d") if d.hour == 0 else d.strftime("%m-%d %H:%M")
+            else:
+                date_str = str(d)[:10]
+
+            if show_clamped:
+                ens = row.get("ensemble", 0) or 0
+                clamped = row.get("ensemble_clamped", ens) or ens
+                ara = row.get("ara_limit", 0) or 0
+                arb = row.get("arb_limit", 0) or 0
+                pct = (clamped / last_price - 1) * 100
+                lines.append(f"{date_str:<12}{ens:>12,.0f}{clamped:>12,.0f}{ara:>10,.0f}{arb:>10,.0f}{pct:>+9.2f}%")
+            else:
+                ens = row.get("ensemble", 0) or 0
+                low = row.get("low", 0) or 0
+                high = row.get("high", 0) or 0
+                pct = (ens / last_price - 1) * 100
+                lines.append(f"{date_str:<12}{ens:>12,.2f}{low:>12,.2f}{high:>12,.2f}{pct:>+9.2f}%")
+
+        # Summary
+        if "ensemble" in forecasts.columns:
+            lines.append(f"\n{'=' * 70}")
+            lines.append(f"SUMMARY ({currency})")
+            lines.append("=" * 70)
+            lines.append(f"  Current price:   {last_price:>14,.0f}")
+
+            if show_clamped:
+                lines.append("\n  Clamped to ARA/ARB limits:")
+                fc = forecasts["ensemble_clamped"]
+            else:
+                fc = forecasts["ensemble"]
+
+            lines.append(f"  Forecast avg:    {fc.mean():>14,.0f} ({(fc.mean()/last_price-1)*100:+.2f}%)")
+            lines.append(f"  Forecast high:   {fc.max():>14,.0f} ({(fc.max()/last_price-1)*100:+.2f}%)")
+            lines.append(f"  Forecast low:    {fc.min():>14,.0f} ({(fc.min()/last_price-1)*100:+.2f}%)")
+            lines.append(f"  Final forecast:  {fc.iloc[-1]:>14,.0f} ({(fc.iloc[-1]/last_price-1)*100:+.2f}%)")
+
+            if "std" in forecasts.columns:
+                avg_std = forecasts["std"].mean()
+                lines.append(f"  Uncertainty:     {avg_std:>14,.0f} (+/- {avg_std/last_price*100:.2f}%)")
+
+            # Direction
+            final = fc.iloc[-1]
+            pct_change = (final / last_price - 1) * 100
+            outlook = Outlook.from_percent_change(pct_change)
+            lines.append(f"\n  Outlook: {outlook.name} ({pct_change:+.2f}%)")
+
+        lines.append(f"\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        with open(out_path, "w") as f:
+            f.write("\n".join(lines))
 
         return out_path
 
@@ -1155,6 +1332,80 @@ def handle_watchlist_update(args: argparse.Namespace, result: BatchResult) -> No
 
 
 # =============================================================================
+# Telegram Integration
+# =============================================================================
+
+def handle_telegram_notification(args: argparse.Namespace, result: BatchResult) -> None:
+    """Handle Telegram notification if requested."""
+    if not args.telegram or not result.successful:
+        return
+
+    print(f"\n{'=' * 70}")
+    print("TELEGRAM NOTIFICATION")
+    print(f"{'=' * 70}")
+
+    # For batch processing (multiple symbols), send a summary
+    if len(result.successful) > 1:
+        tg_results = [
+            {
+                "symbol": s.symbol,
+                "name": s.name,
+                "current_price": s.current_price,
+                "forecast": s.final_forecast,
+                "change_pct": s.change_pct,
+                "outlook": s.outlook.name,
+            }
+            for s in result.successful
+        ]
+
+        print(f"Sending batch summary for {len(tg_results)} symbols...")
+        success = send_batch_notification(
+            results=tg_results,
+            script_name="YF Batch Forecast",
+            silent=getattr(args, "tg_silent", False),
+        )
+        if success:
+            print("  Telegram notification sent successfully")
+    else:
+        # For single symbol, send detailed forecast
+        s = result.successful[0]
+
+        # We don't have the full forecast data here, so create a simple summary
+        tg_forecasts = [{
+            "date": "Final",
+            "price": s.final_forecast,
+            "change_pct": s.change_pct,
+        }]
+
+        # Get ARA/ARB info for Indonesian stocks
+        ara_arb_info = None
+        is_indonesian = s.symbol.endswith(".JK")
+        if is_indonesian:
+            limit_info = get_daily_limit_info(s.current_price)
+            ara_arb_info = {
+                "ara_price": limit_info["ara_price"],
+                "arb_price": limit_info["arb_price"],
+                "max_gain_pct": limit_info["max_gain_pct"],
+                "max_loss_pct": limit_info["max_loss_pct"],
+            }
+
+        print(f"Sending notification for {s.symbol}...")
+        success = send_forecast_notification(
+            symbol=s.symbol,
+            current_price=s.current_price,
+            forecasts=tg_forecasts,
+            outlook=s.outlook.name,
+            change_pct=s.change_pct,
+            currency=s.currency,
+            ara_arb_info=ara_arb_info,
+            script_name="YF Forecast",
+            silent=getattr(args, "tg_silent", False),
+        )
+        if success:
+            print("  Telegram notification sent successfully")
+
+
+# =============================================================================
 # CLI Argument Parser
 # =============================================================================
 
@@ -1218,6 +1469,9 @@ Examples:
     # Add watchlist arguments
     add_watchlist_args(parser)
 
+    # Add telegram arguments
+    add_telegram_args(parser)
+
     return parser
 
 
@@ -1246,6 +1500,14 @@ def main() -> int:
     if hasattr(args, 'watchlist') and args.watchlist:
         try:
             validate_watchlist_args(args)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+
+    # Validate telegram arguments
+    if hasattr(args, 'telegram') and args.telegram:
+        try:
+            validate_telegram_args(args)
         except ValueError as e:
             print(f"Error: {e}")
             return 1
@@ -1283,6 +1545,9 @@ def main() -> int:
 
     # Handle watchlist update
     handle_watchlist_update(args, result)
+
+    # Handle Telegram notification
+    handle_telegram_notification(args, result)
 
     # Return appropriate exit code
     return 1 if result.has_failures else 0

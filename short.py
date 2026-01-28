@@ -53,6 +53,11 @@ from modules.watchlist import (
     update_watchlist,
     validate_watchlist_args,
 )
+from modules.telegram import (
+    add_telegram_args,
+    send_forecast_notification,
+    validate_telegram_args,
+)
 
 # Suppress warnings after imports
 warnings.filterwarnings("ignore")
@@ -1173,6 +1178,9 @@ Examples:
     # Add watchlist arguments
     add_watchlist_args(parser)
 
+    # Add telegram arguments
+    add_telegram_args(parser)
+
     args = parser.parse_args()
 
     # Configure logging
@@ -1183,6 +1191,14 @@ Examples:
     if hasattr(args, 'watchlist') and args.watchlist:
         try:
             validate_watchlist_args(args)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+
+    # Validate telegram arguments
+    if hasattr(args, 'telegram') and args.telegram:
+        try:
+            validate_telegram_args(args)
         except ValueError as e:
             print(f"Error: {e}")
             return 1
@@ -1330,6 +1346,61 @@ Examples:
                 else:
                     filter_type = "bullish" if args.bullish else "bearish" if args.bearish else ""
                     print(f"\nNo symbols to add to watchlist (outlook is {outlook.name}, filter: {filter_type})")
+
+        # Send Telegram notification if requested
+        if args.telegram:
+            price_col = "ensemble_clamped" if "ensemble_clamped" in forecasts.columns else "ensemble"
+            if price_col in forecasts.columns:
+                fc = forecasts[price_col]
+                final_forecast = fc.iloc[-1]
+                pct_change = (final_forecast / last_price - 1) * 100
+                outlook = Outlook.from_price_change(last_price, final_forecast)
+
+                # Prepare forecast data for Telegram
+                tg_forecasts = []
+                for _, row in forecasts.iterrows():
+                    d = row["ds"]
+                    date_str = d.strftime("%H:%M") if hasattr(d, "strftime") else str(d)
+                    price = row.get(price_col, 0) or 0
+                    fc_pct = (price / last_price - 1) * 100
+                    tg_forecasts.append({
+                        "date": date_str,
+                        "price": price,
+                        "change_pct": fc_pct,
+                    })
+
+                # Get ARA/ARB info from meta
+                ara_arb_info = None
+                if "ara_limit" in meta and "arb_limit" in meta:
+                    prev_close = meta.get("prev_close", last_price)
+                    ara_arb_info = {
+                        "ara_price": meta["ara_limit"],
+                        "arb_price": meta["arb_limit"],
+                        "max_gain_pct": (meta["ara_limit"] / prev_close - 1) * 100,
+                        "max_loss_pct": (1 - meta["arb_limit"] / prev_close) * 100,
+                    }
+
+                # Build script name with session info
+                script_name = "Session Forecast"
+                if target_session:
+                    sess = MARKET_SESSIONS.get(target_session)
+                    if sess:
+                        script_name = f"Session {target_session.upper()} ({sess.start}-{sess.end})"
+
+                print(f"\nSending Telegram notification...")
+                success = send_forecast_notification(
+                    symbol=symbol,
+                    current_price=last_price,
+                    forecasts=tg_forecasts,
+                    outlook=outlook.name,
+                    change_pct=pct_change,
+                    currency="IDR",
+                    ara_arb_info=ara_arb_info,
+                    script_name=script_name,
+                    silent=getattr(args, "tg_silent", False),
+                )
+                if success:
+                    print(f"  Telegram notification sent successfully")
 
         return 0
 

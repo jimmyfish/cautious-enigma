@@ -62,7 +62,7 @@ def get_headers() -> Dict[str, str]:
     return headers
 
 
-def get_watchlist_items(watchlist_id: str) -> List[Dict[str, Any]]:
+def get_watchlist_items(watchlist_id: str, debug: bool = False) -> List[Dict[str, Any]]:
     """
     Get all items in a watchlist.
 
@@ -75,11 +75,19 @@ def get_watchlist_items(watchlist_id: str) -> List[Dict[str, Any]]:
     response.raise_for_status()
 
     data = response.json()
-    items = data.get("data", {}).get("watchlist", [])
+
+    if debug:
+        print(f"  DEBUG get_watchlist response keys: {data.keys()}")
+        if "data" in data:
+            print(f"  DEBUG data keys: {data['data'].keys()}")
+
+    # API returns items under "result", not "watchlist"
+    items = data.get("data", {}).get("result", [])
 
     return [
         {
-            "company_id": item.get("company_id"),
+            # API may return "id" or "company_id" depending on endpoint
+            "company_id": item.get("company_id") or item.get("id"),
             "symbol": item.get("symbol"),
             "name": item.get("name"),
         }

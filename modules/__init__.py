@@ -18,6 +18,16 @@ from .common import (
     setup_logging,
 )
 
+from .telegram import (
+    add_telegram_args,
+    format_batch_summary_message,
+    format_forecast_message,
+    send_batch_notification,
+    send_forecast_notification,
+    send_telegram_message,
+    validate_telegram_args,
+)
+
 __all__ = [
     "JsonDict",
     "BASE_DIR",
@@ -30,4 +40,12 @@ __all__ = [
     "setup_logging",
     "load_groups",
     "find_group_for_symbol",
+    # Telegram
+    "add_telegram_args",
+    "validate_telegram_args",
+    "send_telegram_message",
+    "send_forecast_notification",
+    "send_batch_notification",
+    "format_forecast_message",
+    "format_batch_summary_message",
 ]

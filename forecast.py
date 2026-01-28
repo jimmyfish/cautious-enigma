@@ -47,6 +47,12 @@ from modules.watchlist import (
     update_watchlist,
     validate_watchlist_args,
 )
+from modules.telegram import (
+    add_telegram_args,
+    send_forecast_notification,
+    validate_telegram_args,
+)
+from modules.idx_rules import get_daily_limit_info
 
 warnings.filterwarnings("ignore")
 
@@ -118,9 +124,11 @@ class MarketAlphaEngine:
             )
 
         # Calculate OBI from depth section (pre-computed totals)
-        depth = analysis.get("depth", {})
-        bid_vol = self.parse_number(depth.get("bid", {}).get("total_volume", 0))
-        ask_vol = self.parse_number(depth.get("offer", {}).get("total_volume", 0))
+        depth = analysis.get("depth") or {}
+        bid_data = depth.get("bid") or {}
+        ask_data = depth.get("offer") or {}
+        bid_vol = self.parse_number(bid_data.get("total_volume", 0))
+        ask_vol = self.parse_number(ask_data.get("total_volume", 0))
         total_vol = bid_vol + ask_vol
         obi = (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0.0
 
@@ -636,6 +644,7 @@ class StockForecaster:
 
         # Use HuberLoss for robustness to outliers (price gaps, big moves)
         # Use DistributionLoss with StudentT for probabilistic forecasts with heavy tails
+        # Enable start_padding for short time series (group training with few sessions per symbol)
         models = [
             # TFT: Temporal Fusion Transformer with StudentT distribution
             # Provides probabilistic forecasts with confidence intervals
@@ -648,6 +657,7 @@ class StockForecaster:
                 scaler_type="robust",
                 loss=DistributionLoss(distribution="StudentT", level=[80, 90]),
                 random_seed=42,
+                start_padding_enabled=True,
             ),
             # NBEATS: Interpretable basis decomposition with HuberLoss
             # HuberLoss is robust to outliers (combines MSE + MAE)
@@ -658,6 +668,7 @@ class StockForecaster:
                 scaler_type="robust",
                 loss=HuberLoss(),
                 random_seed=42,
+                start_padding_enabled=True,
             ),
             # NHITS: Multi-scale hierarchical with HuberLoss
             NHITS(
@@ -667,6 +678,7 @@ class StockForecaster:
                 scaler_type="robust",
                 loss=HuberLoss(),
                 random_seed=42,
+                start_padding_enabled=True,
             ),
         ]
 
@@ -924,11 +936,152 @@ def print_forecast_table(forecasts: pd.DataFrame, symbol: str, last_price: float
             )
 
 
+def save_forecast_summary(
+    forecasts: pd.DataFrame, symbol: str, last_price: float, filepath: Path
+) -> None:
+    """Save formatted forecast table to text file."""
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"FORECAST: {symbol}")
+    lines.append("=" * 70)
+
+    show_clamped = "ensemble_clamped" in forecasts.columns
+    has_limits = "ara_limit" in forecasts.columns
+
+    # Show ARA/ARB limits
+    limit_info = get_daily_limit_info(last_price)
+    lines.append(f"\nARA/ARB Limits (Day 1 based on {last_price:,.0f} IDR):")
+    lines.append(f"  ARA (Upper): {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)")
+    lines.append(f"  ARB (Lower): {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)")
+
+    # Table header
+    if show_clamped and has_limits:
+        lines.append(f"\n{'Date':<12}{'Forecast':>12}{'Clamped':>12}{'ARA':>10}{'ARB':>10}{'Change':>10}")
+        lines.append("-" * 66)
+    elif show_clamped:
+        lines.append(f"\n{'Date':<12}{'Forecast':>12}{'Clamped':>12}{'Change':>10}")
+        lines.append("-" * 46)
+    else:
+        lines.append(f"\n{'Date':<12}{'Forecast':>12}{'Change':>10}")
+        lines.append("-" * 34)
+
+    # Table rows
+    for _, row in forecasts.iterrows():
+        d = row["ds"]
+        date_str = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
+
+        if show_clamped:
+            ens = row.get("ensemble", 0) or 0
+            clamped = row.get("ensemble_clamped", ens) or ens
+            pct = (clamped / last_price - 1) * 100
+            if has_limits:
+                ara = row.get("ara_limit", 0) or 0
+                arb = row.get("arb_limit", 0) or 0
+                lines.append(f"{date_str:<12}{ens:>12,.0f}{clamped:>12,.0f}{ara:>10,.0f}{arb:>10,.0f}{pct:>+9.2f}%")
+            else:
+                lines.append(f"{date_str:<12}{ens:>12,.0f}{clamped:>12,.0f}{pct:>+9.2f}%")
+        else:
+            ens = row.get("ensemble", 0) or 0
+            pct = (ens / last_price - 1) * 100
+            lines.append(f"{date_str:<12}{ens:>12,.0f}{pct:>+9.2f}%")
+
+    # Summary
+    lines.append(f"\n{'=' * 70}")
+    lines.append("SUMMARY (IDR)")
+    lines.append("=" * 70)
+    lines.append(f"  Current price:   {last_price:>14,.0f}")
+
+    if show_clamped:
+        lines.append("\n  Clamped to ARA/ARB limits:")
+        fc = forecasts["ensemble_clamped"]
+    else:
+        fc = forecasts["ensemble"]
+
+    lines.append(f"  Forecast avg:    {fc.mean():>14,.0f} ({(fc.mean()/last_price-1)*100:+.2f}%)")
+    lines.append(f"  Forecast high:   {fc.max():>14,.0f} ({(fc.max()/last_price-1)*100:+.2f}%)")
+    lines.append(f"  Forecast low:    {fc.min():>14,.0f} ({(fc.min()/last_price-1)*100:+.2f}%)")
+    lines.append(f"  Final forecast:  {fc.iloc[-1]:>14,.0f} ({(fc.iloc[-1]/last_price-1)*100:+.2f}%)")
+
+    if "ensemble_std" in forecasts.columns:
+        avg_std = forecasts["ensemble_std"].mean()
+        lines.append(f"  Uncertainty:     {avg_std:>14,.0f} (+/- {avg_std/last_price*100:.2f}%)")
+
+    # Outlook
+    final = fc.iloc[-1]
+    pct_change = (final / last_price - 1) * 100
+    outlook = "BULLISH" if pct_change > 2 else "BEARISH" if pct_change < -2 else "NEUTRAL"
+    lines.append(f"\n  Outlook: {outlook} ({pct_change:+.2f}%)")
+
+    lines.append(f"\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    with open(filepath, "w") as f:
+        f.write("\n".join(lines))
+
+
+def _add_forecast_table_to_plot(fig, forecasts: pd.DataFrame, last_price: float, symbol: str) -> None:
+    """Add forecast table as text annotation on the right side of the plot."""
+    show_clamped = "ensemble_clamped" in forecasts.columns
+    has_limits = "ara_limit" in forecasts.columns
+
+    lines = []
+    lines.append("FORECAST TABLE")
+    lines.append("-" * 30)
+
+    # Show ARA/ARB limits
+    limit_info = get_daily_limit_info(last_price)
+    lines.append(f"ARA/ARB ({last_price:,.0f}):")
+    lines.append(f"  ARA: {limit_info['ara_price']:,.0f} (+{limit_info['max_gain_pct']:.1f}%)")
+    lines.append(f"  ARB: {limit_info['arb_price']:,.0f} (-{limit_info['max_loss_pct']:.1f}%)")
+    lines.append("")
+
+    # Table header
+    if show_clamped:
+        lines.append(f"{'Date':<10} {'Clamp':>8} {'Chg':>7}")
+    else:
+        lines.append(f"{'Date':<10} {'Fcst':>8} {'Chg':>7}")
+    lines.append("-" * 27)
+
+    # Table rows
+    for _, row in forecasts.iterrows():
+        d = row["ds"]
+        date_str = d.strftime("%m-%d") if hasattr(d, "strftime") else str(d)[5:10]
+
+        if show_clamped:
+            val = row.get("ensemble_clamped", row.get("ensemble", 0)) or 0
+        else:
+            val = row.get("ensemble", 0) or 0
+
+        pct = (val / last_price - 1) * 100
+        lines.append(f"{date_str:<10} {val:>8,.0f} {pct:>+6.1f}%")
+
+    # Summary
+    lines.append("-" * 27)
+    price_col = "ensemble_clamped" if show_clamped else "ensemble"
+    if price_col in forecasts.columns:
+        fc = forecasts[price_col]
+        final = fc.iloc[-1]
+        pct_change = (final / last_price - 1) * 100
+        outlook = "BULL" if pct_change > 2 else "BEAR" if pct_change < -2 else "NEUT"
+        lines.append(f"Final: {final:,.0f} ({pct_change:+.1f}%)")
+        lines.append(f"Outlook: {outlook}")
+
+    # Join and add to figure
+    text = "\n".join(lines)
+    fig.text(
+        0.78, 0.5, text,
+        fontsize=8,
+        fontfamily="monospace",
+        verticalalignment="center",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow", alpha=0.9)
+    )
+
+
 def plot_results(
     historical: pd.DataFrame,
     forecasts: pd.DataFrame,
     symbol: str,
     alpha_df: pd.DataFrame,
+    last_price: float = 0.0,
 ):
     """Plot price forecast with alpha features."""
     try:
@@ -1060,7 +1213,12 @@ def plot_results(
         ax3.grid(True, alpha=0.3)
         ax3.legend(loc="upper left")
 
+        # Add forecast table as text annotation
+        if last_price > 0:
+            _add_forecast_table_to_plot(fig, forecasts, last_price, symbol)
+
         plt.tight_layout()
+        plt.subplots_adjust(right=0.75)
 
         plot_dir = Path("plot") / symbol
         plot_dir.mkdir(parents=True, exist_ok=True)
@@ -1119,12 +1277,23 @@ Examples:
     # Add watchlist arguments
     add_watchlist_args(parser)
 
+    # Add telegram arguments
+    add_telegram_args(parser)
+
     args = parser.parse_args()
 
     # Validate watchlist arguments
     if hasattr(args, "watchlist") and args.watchlist:
         try:
             validate_watchlist_args(args)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    # Validate telegram arguments
+    if hasattr(args, "telegram") and args.telegram:
+        try:
+            validate_telegram_args(args)
         except ValueError as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -1177,6 +1346,12 @@ Examples:
         print("Edit models/groups.json to add groups.")
         sys.exit(1)
 
+    # Auto-detect group if not specified
+    if not group_name:
+        group_name = find_group_for_symbol(symbol, groups)
+        if group_name:
+            print(f"Auto-detected group: {group_name}")
+
     print(f"\n{'=' * 70}")
     print(f"STOCK FORECASTER - {symbol}")
     print(f"{'=' * 70}")
@@ -1225,15 +1400,31 @@ Examples:
         if not args.no_plot:
             # Use symbol-specific data for plots when using group training
             plot_data = symbol_data if group_name and not symbol_data.empty else df
-            plot_results(historical, forecasts, symbol, plot_data)
+            # Filter historical to only show target symbol when using group training
+            if group_name and "unique_id" in historical.columns:
+                hist_plot = historical[historical["unique_id"] == symbol].copy()
+            else:
+                hist_plot = historical
+            plot_results(hist_plot, forecasts, symbol, plot_data, last_price)
 
         symbol_csv_dir = CSV_DIR / symbol
         symbol_csv_dir.mkdir(parents=True, exist_ok=True)
-        output_file = (
-            symbol_csv_dir / f"forecast_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-        forecasts.to_csv(output_file, index=False)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # Add change_pct column before saving
+        df_to_save = forecasts.copy()
+        price_col = "ensemble_clamped" if "ensemble_clamped" in df_to_save.columns else "ensemble"
+        if price_col in df_to_save.columns:
+            df_to_save["change_pct"] = (df_to_save[price_col] / last_price - 1) * 100
+
+        output_file = symbol_csv_dir / f"forecast_{timestamp}.csv"
+        df_to_save.to_csv(output_file, index=False)
         print(f"\nSaved: {output_file}")
+
+        # Save summary text file
+        summary_file = symbol_csv_dir / f"forecast_{timestamp}_summary.txt"
+        save_forecast_summary(forecasts, symbol, last_price, summary_file)
+        print(f"Saved: {summary_file}")
 
         # Update watchlist if requested
         if args.watchlist:
@@ -1284,6 +1475,61 @@ Examples:
                     print(
                         f"\nNo symbols to add to watchlist (outlook is {outlook}, filter: {filter_type})"
                     )
+
+        # Send Telegram notification if requested
+        if args.telegram:
+            price_col = (
+                "ensemble_clamped"
+                if "ensemble_clamped" in forecasts.columns
+                else "ensemble"
+            )
+            if price_col in forecasts.columns:
+                final_forecast = forecasts[price_col].iloc[-1]
+                pct_change = (final_forecast / last_price - 1) * 100
+
+                if pct_change > 2:
+                    outlook = "BULLISH"
+                elif pct_change < -2:
+                    outlook = "BEARISH"
+                else:
+                    outlook = "NEUTRAL"
+
+                # Prepare forecast data for Telegram
+                tg_forecasts = []
+                for _, row in forecasts.iterrows():
+                    d = row["ds"]
+                    date_str = d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
+                    price = row.get(price_col, 0) or 0
+                    fc_pct = (price / last_price - 1) * 100
+                    tg_forecasts.append({
+                        "date": date_str,
+                        "price": price,
+                        "change_pct": fc_pct,
+                    })
+
+                # Get ARA/ARB info
+                limit_info = get_daily_limit_info(last_price)
+                ara_arb_info = {
+                    "ara_price": limit_info["ara_price"],
+                    "arb_price": limit_info["arb_price"],
+                    "max_gain_pct": limit_info["max_gain_pct"],
+                    "max_loss_pct": limit_info["max_loss_pct"],
+                }
+
+                print(f"\nSending Telegram notification...")
+                success = send_forecast_notification(
+                    symbol=symbol,
+                    current_price=last_price,
+                    forecasts=tg_forecasts,
+                    outlook=outlook,
+                    change_pct=pct_change,
+                    currency="IDR",
+                    ara_arb_info=ara_arb_info,
+                    script_name="Daily Forecast",
+                    silent=getattr(args, "tg_silent", False),
+                )
+                if success:
+                    print(f"  Telegram notification sent successfully")
 
     except Exception as e:
         print(f"\nError: {e}")
