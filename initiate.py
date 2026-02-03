@@ -980,6 +980,12 @@ class DataFetcher:
                             status=FetchStatus.RATE_LIMITED,
                         )
 
+                if response.status_code == 401:
+                    raise AuthenticationError(
+                        "Authentication failed (401 Unauthorized)",
+                        status_code=401
+                    )
+
                 if response.status_code >= 500:
                     if attempt < self.max_retries:
                         retries_used += 1
@@ -1480,7 +1486,13 @@ def main() -> int:
             return 0
 
     batch_processor = BatchProcessor(session, args.jobs)
-    result = batch_processor.process(symbols)
+
+    try:
+        result = batch_processor.process(symbols)
+    except AuthenticationError as e:
+        logger.error(f"Authentication failed: {e}")
+        send_telegram("<b>Initiate Failed</b>\nAuthentication error (401). Please check SB_AUTH token.")
+        return 1
 
     print("\nDone")
     print(f"Processed: {result.processed}")

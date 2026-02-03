@@ -85,9 +85,13 @@ DEFAULT_HORIZON: Final[int] = 5
 DEFAULT_INTERVAL: Final[str] = "1d"
 DEFAULT_PERIOD: Final[str] = "3mo"
 MIN_DATA_POINTS: Final[int] = 10
-MAX_TRAINING_STEPS: Final[int] = 300
+MAX_TRAINING_STEPS: Final[int] = 500
+EARLY_STOP_PATIENCE: Final[int] = 50
+VAL_CHECK_STEPS: Final[int] = 25
 RANDOM_SEED: Final[int] = 42
 MIN_PRICE_THRESHOLD: Final[float] = 50.0
+MAX_INPUT_SIZE: Final[int] = 60
+VAL_SIZE_RATIO: Final[float] = 0.1  # 10% of data for validation
 
 # Outlook thresholds
 BULLISH_THRESHOLD: Final[float] = 2.0
@@ -516,10 +520,17 @@ class YFinanceForecaster:
             logger.warning(f"  Limiting horizon from {self.horizon} to {max_h}")
             self.horizon = max_h
 
+        # Warn about aggressive horizons that may lead to unreliable forecasts
+        if self.horizon > 15 and self.interval == "1d":
+            logger.warning(
+                f"  WARNING: Horizon of {self.horizon} days may produce unreliable forecasts. "
+                f"Consider using --horizon 10 or less for daily data."
+            )
+
         return self.horizon
 
     def _create_models(self, input_size: int, features: List[str]) -> List:
-        """Create model instances."""
+        """Create model instances with early stopping and regularization."""
         return [
             # NBEATS doesn't support exogenous variables
             NBEATS(
@@ -528,6 +539,8 @@ class YFinanceForecaster:
                 max_steps=self.max_steps,
                 scaler_type="robust",
                 random_seed=RANDOM_SEED,
+                early_stop_patience_steps=EARLY_STOP_PATIENCE,
+                val_check_steps=VAL_CHECK_STEPS,
             ),
             NHITS(
                 h=self.horizon,
@@ -536,6 +549,8 @@ class YFinanceForecaster:
                 scaler_type="robust",
                 random_seed=RANDOM_SEED,
                 hist_exog_list=features if features else None,
+                early_stop_patience_steps=EARLY_STOP_PATIENCE,
+                val_check_steps=VAL_CHECK_STEPS,
             ),
             LSTM(
                 h=self.horizon,
@@ -544,6 +559,8 @@ class YFinanceForecaster:
                 scaler_type="robust",
                 random_seed=RANDOM_SEED,
                 hist_exog_list=features if features else None,
+                early_stop_patience_steps=EARLY_STOP_PATIENCE,
+                val_check_steps=VAL_CHECK_STEPS,
             ),
         ]
 
@@ -566,22 +583,26 @@ class YFinanceForecaster:
         # Validate and adjust
         self.horizon = self._validate_data(n)
 
-        # Calculate input size
-        input_size = min(n - self.horizon - 1, 30)
+        # Calculate input size (increased cap for better pattern recognition)
+        input_size = min(n - self.horizon - 1, MAX_INPUT_SIZE)
         input_size = max(input_size, 5)
 
         # Print config
-        self._print_config(input_size, features)
+        self._print_config(input_size, features, n)
 
         # Create and train models
         models = self._create_models(input_size, features)
         freq = VALID_INTERVALS.get(self.interval, IntervalConfig("max", "D")).freq
 
+        # Calculate validation size (10% of data, minimum of horizon)
+        val_size = max(int(n * VAL_SIZE_RATIO), self.horizon)
+
         logger.info(f"  Frequency: {freq}")
+        logger.info(f"  Validation size: {val_size} periods")
         logger.info(f"\nTraining: {[m.__class__.__name__ for m in models]}")
 
         self.nf = NeuralForecast(models=models, freq=freq)
-        self.nf.fit(df=nf_df)
+        self.nf.fit(df=nf_df, val_size=val_size)
 
         logger.info(f"Generating {self.horizon}-step forecast...")
         forecasts = pd.DataFrame(self.nf.predict())
@@ -638,7 +659,7 @@ class YFinanceForecaster:
         print(f"  Last price: {nf_df['y'].iloc[-1]:,.2f}")
         print(f"  Features: {len(features)}")
 
-    def _print_config(self, input_size: int, features: List[str]) -> None:
+    def _print_config(self, input_size: int, features: List[str], n_records: int = 0) -> None:
         """Print forecast configuration."""
         print(f"\n{'=' * 60}")
         print("FORECAST CONFIG")
@@ -646,6 +667,12 @@ class YFinanceForecaster:
         print(f"  Horizon: {self.horizon} periods")
         print(f"  Lookback: {input_size} periods")
         print(f"  Interval: {self.interval}")
+        print(f"  Max steps: {self.max_steps}")
+        print(f"  Early stop patience: {EARLY_STOP_PATIENCE} steps")
+        print(f"  Validation check: every {VAL_CHECK_STEPS} steps")
+        if n_records > 0:
+            val_size = max(int(n_records * VAL_SIZE_RATIO), self.horizon)
+            print(f"  Validation size: {val_size} periods ({VAL_SIZE_RATIO*100:.0f}% of data)")
         print(f"  Exog features: {features}")
 
 
