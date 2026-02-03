@@ -16,8 +16,9 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-# Telegram API base URL
+# Telegram API base URLs
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_PHOTO_API_URL = "https://api.telegram.org/bot{token}/sendPhoto"
 
 
 def get_telegram_config() -> tuple[str, str]:
@@ -83,6 +84,62 @@ def send_telegram_message(
     return True
 
 
+def send_telegram_photo(
+    photo_path: str,
+    caption: str = "",
+    parse_mode: str = "HTML",
+    disable_notification: bool = False,
+) -> bool:
+    """
+    Send a photo via Telegram Bot API.
+
+    Args:
+        photo_path: Path to the image file
+        caption: Optional caption text (max 1024 chars)
+        parse_mode: Caption format (HTML, Markdown, MarkdownV2)
+        disable_notification: If True, send silently
+
+    Returns:
+        True if photo was sent successfully
+
+    Raises:
+        ValueError: If Telegram is not configured
+        FileNotFoundError: If photo file doesn't exist
+        requests.RequestException: On API error
+    """
+    import os
+    if not os.path.exists(photo_path):
+        raise FileNotFoundError(f"Photo not found: {photo_path}")
+
+    bot_token, chat_id = get_telegram_config()
+
+    url = TELEGRAM_PHOTO_API_URL.format(token=bot_token)
+
+    # Truncate caption if too long (Telegram limit is 1024 chars)
+    if len(caption) > 1024:
+        caption = caption[:1021] + "..."
+
+    data = {
+        "chat_id": chat_id,
+        "parse_mode": parse_mode,
+        "disable_notification": disable_notification,
+    }
+    if caption:
+        data["caption"] = caption
+
+    with open(photo_path, "rb") as photo_file:
+        files = {"photo": photo_file}
+        response = requests.post(url, data=data, files=files, timeout=60)
+
+    response.raise_for_status()
+
+    result = response.json()
+    if not result.get("ok"):
+        raise requests.RequestException(f"Telegram API error: {result.get('description')}")
+
+    return True
+
+
 def format_forecast_message(
     symbol: str,
     current_price: float,
@@ -109,12 +166,12 @@ def format_forecast_message(
     Returns:
         Formatted HTML message string
     """
-    # Outlook emoji
+    # Outlook indicators
     outlook_emoji = {
-        "BULLISH": "\U0001F7E2",  # Green circle
-        "BEARISH": "\U0001F534",  # Red circle
-        "NEUTRAL": "\U0001F7E1",  # Yellow circle
-    }.get(outlook.upper(), "\u2B55")  # Hollow circle fallback
+        "BULLISH": "\U0001F4C8",  # 📈 Chart increasing (green)
+        "BEARISH": "\U0001F53B",  # 🔻 Red triangle down
+        "NEUTRAL": "\U0001F7E1",  # 🟡 Yellow circle
+    }.get(outlook.upper(), "\U0001F7E1")  # Yellow circle fallback
 
     lines = []
     lines.append(f"<b>{outlook_emoji} {symbol} - {script_name}</b>")
@@ -174,7 +231,7 @@ def format_batch_summary_message(
 
     lines = []
     lines.append(f"<b>{script_name} - {len(results)} Symbols</b>")
-    lines.append(f"\U0001F7E2 Bullish: {bullish} | \U0001F534 Bearish: {bearish} | \U0001F7E1 Neutral: {neutral}")
+    lines.append(f"\U0001F4C8 Bullish: {bullish} | \U0001F53B Bearish: {bearish} | \U0001F7E1 Neutral: {neutral}")
     lines.append("")
     lines.append("<pre>")
     lines.append(f"{'Symbol':<8}{'Price':>10}{'Fcst':>10}{'Chg':>8}")
@@ -187,9 +244,9 @@ def format_batch_summary_message(
         pct = r.get("change_pct", 0)
         outlook = r.get("outlook", "").upper()
 
-        # Emoji prefix based on outlook
-        emoji = "\U0001F7E2" if outlook == "BULLISH" else "\U0001F534" if outlook == "BEARISH" else " "
-        lines.append(f"{emoji}{symbol:<7}{current:>10,.0f}{forecast:>10,.0f}{pct:>+7.1f}%")
+        # Indicator based on outlook
+        indicator = "\U0001F4C8" if outlook == "BULLISH" else "\U0001F53B" if outlook == "BEARISH" else "\U0001F7E1"
+        lines.append(f"{indicator}{symbol:<7}{current:>10,.0f}{forecast:>10,.0f}{pct:>+7.1f}%")
 
     lines.append("</pre>")
 
@@ -206,6 +263,7 @@ def send_forecast_notification(
     ara_arb_info: Optional[Dict[str, Any]] = None,
     script_name: str = "Forecast",
     silent: bool = False,
+    plot_path: Optional[str] = None,
 ) -> bool:
     """
     Send forecast results via Telegram.
@@ -220,6 +278,7 @@ def send_forecast_notification(
         ara_arb_info: Optional ARA/ARB info for Indonesian stocks
         script_name: Name of the forecasting script
         silent: If True, send without notification sound
+        plot_path: Optional path to chart image to attach
 
     Returns:
         True if sent successfully, False on error
@@ -235,7 +294,16 @@ def send_forecast_notification(
             ara_arb_info=ara_arb_info,
             script_name=script_name,
         )
-        return send_telegram_message(message, disable_notification=silent)
+
+        # If plot provided, send as photo with caption
+        if plot_path:
+            return send_telegram_photo(
+                photo_path=plot_path,
+                caption=message,
+                disable_notification=silent,
+            )
+        else:
+            return send_telegram_message(message, disable_notification=silent)
     except Exception as e:
         print(f"  Telegram notification failed: {e}")
         return False
@@ -245,6 +313,7 @@ def send_batch_notification(
     results: List[Dict[str, Any]],
     script_name: str = "Batch Forecast",
     silent: bool = False,
+    plot_path: Optional[str] = None,
 ) -> bool:
     """
     Send batch forecast results via Telegram.
@@ -253,13 +322,23 @@ def send_batch_notification(
         results: List of result dicts
         script_name: Name of the forecasting script
         silent: If True, send without notification sound
+        plot_path: Optional path to chart image to attach
 
     Returns:
         True if sent successfully, False on error
     """
     try:
         message = format_batch_summary_message(results, script_name)
-        return send_telegram_message(message, disable_notification=silent)
+
+        # If plot provided, send as photo with caption
+        if plot_path:
+            return send_telegram_photo(
+                photo_path=plot_path,
+                caption=message,
+                disable_notification=silent,
+            )
+        else:
+            return send_telegram_message(message, disable_notification=silent)
     except Exception as e:
         print(f"  Telegram notification failed: {e}")
         return False

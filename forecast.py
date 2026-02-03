@@ -1082,8 +1082,8 @@ def plot_results(
     symbol: str,
     alpha_df: pd.DataFrame,
     last_price: float = 0.0,
-):
-    """Plot price forecast with alpha features."""
+) -> Optional[Path]:
+    """Plot price forecast with alpha features. Returns path to saved plot."""
     try:
         import matplotlib.pyplot as plt
 
@@ -1228,9 +1228,11 @@ def plot_results(
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {output_path}")
         plt.close()
+        return output_path
 
     except ImportError:
         print("\nMatplotlib not available")
+        return None
 
 
 def main():
@@ -1397,6 +1399,7 @@ Examples:
 
         print_forecast_table(forecasts, symbol, last_price)
 
+        plot_path = None
         if not args.no_plot:
             # Use symbol-specific data for plots when using group training
             plot_data = symbol_data if group_name and not symbol_data.empty else df
@@ -1405,7 +1408,7 @@ Examples:
                 hist_plot = historical[historical["unique_id"] == symbol].copy()
             else:
                 hist_plot = historical
-            plot_results(hist_plot, forecasts, symbol, plot_data, last_price)
+            plot_path = plot_results(hist_plot, forecasts, symbol, plot_data, last_price)
 
         symbol_csv_dir = CSV_DIR / symbol
         symbol_csv_dir.mkdir(parents=True, exist_ok=True)
@@ -1527,6 +1530,7 @@ Examples:
                     ara_arb_info=ara_arb_info,
                     script_name="Daily Forecast",
                     silent=getattr(args, "tg_silent", False),
+                    plot_path=str(plot_path) if plot_path else None,
                 )
                 if success:
                     print(f"  Telegram notification sent successfully")

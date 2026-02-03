@@ -1400,6 +1400,7 @@ def handle_telegram_notification(args: argparse.Namespace, result: BatchResult) 
             ara_arb_info=ara_arb_info,
             script_name="YF Forecast",
             silent=getattr(args, "tg_silent", False),
+            plot_path=str(s.plot_path) if s.plot_path else None,
         )
         if success:
             print("  Telegram notification sent successfully")

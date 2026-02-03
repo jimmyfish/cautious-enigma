@@ -999,8 +999,8 @@ def print_results(forecasts: pd.DataFrame, last_price: float, symbol: str, meta:
 
 def plot_forecast(
     ohlcv: pd.DataFrame, forecasts: pd.DataFrame, symbol: str, meta: dict
-):
-    """Plot historical and forecast."""
+) -> Optional[Path]:
+    """Plot historical and forecast. Returns path to saved plot."""
     try:
         import matplotlib.dates as mdates
         import matplotlib.pyplot as plt
@@ -1119,9 +1119,11 @@ def plot_forecast(
         plt.savefig(out, dpi=150, bbox_inches="tight")
         print(f"\nChart saved: {out}")
         plt.close()
+        return out
 
     except ImportError:
         print("\nMatplotlib not available")
+        return None
 
 
 def main() -> int:
@@ -1302,10 +1304,11 @@ Examples:
 
         print_results(forecasts, last_price, symbol, meta)
 
+        plot_path = None
         if not args.no_plot:
             # Use symbol-specific data for plots when using group training
             plot_data: pd.DataFrame = symbol_data if group_name and not symbol_data.empty else ohlcv  # type: ignore[assignment]
-            plot_forecast(plot_data, forecasts, symbol, meta)
+            plot_path = plot_forecast(plot_data, forecasts, symbol, meta)
 
         symbol_csv_dir = CSV_DIR / symbol
         symbol_csv_dir.mkdir(parents=True, exist_ok=True)
@@ -1398,6 +1401,7 @@ Examples:
                     ara_arb_info=ara_arb_info,
                     script_name=script_name,
                     silent=getattr(args, "tg_silent", False),
+                    plot_path=str(plot_path) if plot_path else None,
                 )
                 if success:
                     print(f"  Telegram notification sent successfully")
