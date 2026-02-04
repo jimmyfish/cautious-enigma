@@ -206,6 +206,7 @@
     "BOAT",
     "BSML",
     "BSSR",
+    "BUMI",
     "BYAN",
     "CGAS",
     "DSSA",
@@ -312,15 +313,7 @@
     "URBN",
     "VAST"
   ],
-  "transportation": [
-    "ASSA",
-    "BIRD",
-    "HELI",
-    "IMJS",
-    "LRNA",
-    "SAFE",
-    "TRJA"
-  ],
+  "transportation": ["ASSA", "BIRD", "HELI", "IMJS", "LRNA", "SAFE", "TRJA"],
   "logistic": [
     "AKSI",
     "BLOG",
@@ -404,11 +397,7 @@
     "UNIC",
     "YPAS"
   ],
-  "investment": [
-    "AMOR",
-    "PANS",
-    "RELI"
-  ],
+  "investment": ["AMOR", "PANS", "RELI"],
   "lending": [
     "ADMF",
     "BBLD",
@@ -521,23 +510,8 @@
     "VISI",
     "VOKS"
   ],
-  "utility": [
-    "ARKO",
-    "BREN",
-    "CDIA",
-    "HGII",
-    "KEEN",
-    "PGEO",
-    "POWR"
-  ],
-  "infrastructure": [
-    "CASS",
-    "CMNP",
-    "IPCC",
-    "IPCM",
-    "JSMR",
-    "PORT"
-  ],
+  "utility": ["ARKO", "BREN", "CDIA", "HGII", "KEEN", "PGEO", "POWR"],
+  "infrastructure": ["CASS", "CMNP", "IPCC", "IPCM", "JSMR", "PORT"],
   "telco": [
     "BALI",
     "DATA",
@@ -606,7 +580,6 @@
     "BSBK",
     "BUDI",
     "BULL",
-    "BUMI",
     "BUVA",
     "BVIC",
     "BWPT",
@@ -770,7 +743,5 @@
     "YULE",
     "ZATA"
   ],
-  "problematic_suspended": [
-    "DKHH"
-  ]
+  "problematic_suspended": ["DKHH"]
 }

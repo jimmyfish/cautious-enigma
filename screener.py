@@ -2,15 +2,20 @@
 """
 Stockbit Screener with optional forecaster integration.
 
+Filters results by groups.json by default (excludes symbols not in your groups).
+
 Usage:
-    python screener.py                                  # Fetch default screener
+    python screener.py                                  # Fetch + filter by groups.json
     python screener.py -t TEMPLATE_ID                   # Fetch specific screener
+    python screener.py --no-filter                      # Disable groups.json filter
     python screener.py --forecast [FORECASTER_ARGS]    # Run forecast.py after screener
     python screener.py --short [FORECASTER_ARGS]       # Run short.py after screener
     python screener.py --yf [FORECASTER_ARGS]          # Run yf.py after screener
 
 Examples:
     python screener.py -t 4475032
+    python screener.py --yf -n 5 --period 3mo          # Filter + forecast
+    python screener.py --no-filter --yf -n 5           # No filter + forecast
     python screener.py --forecast -w -wid 5393656 -bl
     python screener.py --yf -n 5 --period 3mo -w -wid 5393656 -bl
     python screener.py -t 4475032 --short --session1 -w -wid 5393656
@@ -22,13 +27,63 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import requests
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Path to groups.json
+GROUPS_JSON_PATH = Path(__file__).resolve().parent / "models" / "groups.json"
+
+
+def load_groups_symbols() -> Set[str]:
+    """
+    Load all symbols from groups.json.
+
+    Returns:
+        Set of all symbols across all groups (excluding problematic groups).
+    """
+    if not GROUPS_JSON_PATH.exists():
+        print(f"Warning: {GROUPS_JSON_PATH} not found")
+        return set()
+
+    try:
+        with open(GROUPS_JSON_PATH) as f:
+            groups = json.load(f)
+
+        all_symbols: Set[str] = set()
+
+        for group_name, symbols in groups.items():
+            all_symbols.update(symbols)
+
+        return all_symbols
+
+    except Exception as e:
+        print(f"Warning: Failed to load groups.json: {e}")
+        return set()
+
+
+def filter_by_groups(symbols: List[str], groups_symbols: Set[str]) -> List[str]:
+    """
+    Filter symbols to only include those in groups.json.
+
+    Args:
+        symbols: List of symbols from screener
+        groups_symbols: Set of valid symbols from groups.json
+
+    Returns:
+        Filtered list of symbols
+    """
+    filtered = [s for s in symbols if s in groups_symbols]
+    removed = [s for s in symbols if s not in groups_symbols]
+
+    if removed:
+        print(f"  Filtered out {len(removed)} symbols not in groups.json: {', '.join(removed)}")
+
+    return filtered
 
 
 def normalize_auth(token):
@@ -188,6 +243,8 @@ def main():
         epilog="""
 Examples:
     python screener.py -t 4475032
+    python screener.py --yf -n 5 --period 3mo                 # Filter + forecast
+    python screener.py --no-filter --yf -n 5                  # Disable filter
     python screener.py --forecast -w -wid 5393656 -bl
     python screener.py --yf -n 5 --period 3mo -w -wid 5393656 -bl
     python screener.py -t 4475032 --short --session1 -w -wid 5393656
@@ -201,6 +258,13 @@ Examples:
         default=4475032,
         dest="template_id",
         help="Screener template ID (default: 4475032)",
+    )
+
+    parser.add_argument(
+        "--no-filter",
+        action="store_true",
+        dest="no_filter",
+        help="Disable filtering by groups.json (filtering is ON by default)",
     )
 
     # Mutually exclusive forecaster options
@@ -247,6 +311,19 @@ Examples:
     if not symbols:
         print("\nNo symbols found in screener")
         sys.exit(0)
+
+    # Apply groups.json filter (enabled by default)
+    if not args.no_filter:
+        print("\nFiltering by groups.json...")
+        groups_symbols = load_groups_symbols()
+        if groups_symbols:
+            original_count = len(symbols)
+            symbols = filter_by_groups(symbols, groups_symbols)
+            print(f"  Kept {len(symbols)}/{original_count} symbols")
+
+            if not symbols:
+                print("\nNo symbols remaining after filter")
+                sys.exit(0)
 
     print("\nScreener data fetched successfully!")
 

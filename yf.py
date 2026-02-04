@@ -583,8 +583,13 @@ class YFinanceForecaster:
         # Validate and adjust
         self.horizon = self._validate_data(n)
 
-        # Calculate input size (increased cap for better pattern recognition)
-        input_size = min(n - self.horizon - 1, MAX_INPUT_SIZE)
+        # Calculate validation size first (needed for input_size calculation)
+        val_size = max(int(n * VAL_SIZE_RATIO), self.horizon)
+
+        # Calculate input size accounting for horizon and validation set
+        # Need: input_size + horizon + val_size < n
+        max_input = n - self.horizon - val_size - 1
+        input_size = min(max_input, MAX_INPUT_SIZE)
         input_size = max(input_size, 5)
 
         # Print config
@@ -593,9 +598,6 @@ class YFinanceForecaster:
         # Create and train models
         models = self._create_models(input_size, features)
         freq = VALID_INTERVALS.get(self.interval, IntervalConfig("max", "D")).freq
-
-        # Calculate validation size (10% of data, minimum of horizon)
-        val_size = max(int(n * VAL_SIZE_RATIO), self.horizon)
 
         logger.info(f"  Frequency: {freq}")
         logger.info(f"  Validation size: {val_size} periods")
