@@ -66,26 +66,6 @@ def load_groups_symbols() -> Set[str]:
         return set()
 
 
-def filter_by_groups(symbols: List[str], groups_symbols: Set[str]) -> List[str]:
-    """
-    Filter symbols to only include those in groups.json.
-
-    Args:
-        symbols: List of symbols from screener
-        groups_symbols: Set of valid symbols from groups.json
-
-    Returns:
-        Filtered list of symbols
-    """
-    filtered = [s for s in symbols if s in groups_symbols]
-    removed = [s for s in symbols if s not in groups_symbols]
-
-    if removed:
-        print(f"  Filtered out {len(removed)} symbols not in groups.json: {', '.join(removed)}")
-
-    return filtered
-
-
 def normalize_auth(token):
     if not token:
         return None
@@ -93,10 +73,16 @@ def normalize_auth(token):
 
 
 def fetch_screener(
-    template_id: int, auth_token: str, output_path: Path
+    template_id: int, auth_token: str, output_path: Path, filter_symbols: Optional[Set[str]] = None
 ) -> Optional[List[str]]:
     """
     Fetch screener template results and save to JSON file.
+
+    Args:
+        template_id: Screener template ID
+        auth_token: Authorization token
+        output_path: Path to save JSON output
+        filter_symbols: Optional set of valid symbols to filter by
 
     Returns list of symbols or None on failure.
     """
@@ -122,16 +108,31 @@ def fetch_screener(
         res.raise_for_status()
 
         data = res.json()
-        output_path.write_text(json.dumps(data, indent=4, ensure_ascii=False))
 
-        # Extract and display summary
+        # Extract and filter symbols
         if "data" in data and "calcs" in data["data"]:
-            symbols = [calc["company"]["symbol"] for calc in data["data"]["calcs"]]
+            all_symbols = [calc["company"]["symbol"] for calc in data["data"]["calcs"]]
+
+            # Apply filter if provided
+            if filter_symbols:
+                # Filter the calcs in the data structure
+                data["data"]["calcs"] = [
+                    calc for calc in data["data"]["calcs"]
+                    if calc["company"]["symbol"] in filter_symbols
+                ]
+                symbols = [calc["company"]["symbol"] for calc in data["data"]["calcs"]]
+            else:
+                symbols = all_symbols
+
+            # Save filtered data
+            output_path.write_text(json.dumps(data, indent=4, ensure_ascii=False))
+
             print(f"Fetched screener data: {len(symbols)} companies")
             print(f"  Symbols: {', '.join(symbols)}")
             print(f"  Saved to: {output_path}")
             return symbols
         else:
+            output_path.write_text(json.dumps(data, indent=4, ensure_ascii=False))
             print("Fetched screener data")
             print(f"  Saved to: {output_path}")
             print("  Warning: Unexpected response structure")
@@ -301,8 +302,13 @@ Examples:
     workspace_root = Path(__file__).resolve().parent
     output_path = workspace_root / "screener.json"
 
-    # Fetch and save screener data
-    symbols = fetch_screener(args.template_id, sb_auth, output_path)
+    # Load groups filter (enabled by default)
+    filter_symbols = None
+    if not args.no_filter:
+        filter_symbols = load_groups_symbols()
+
+    # Fetch, filter, and save screener data
+    symbols = fetch_screener(args.template_id, sb_auth, output_path, filter_symbols)
 
     if symbols is None:
         print("\nFailed to fetch screener data")
@@ -311,21 +317,6 @@ Examples:
     if not symbols:
         print("\nNo symbols found in screener")
         sys.exit(0)
-
-    # Apply groups.json filter (enabled by default)
-    if not args.no_filter:
-        print("\nFiltering by groups.json...")
-        groups_symbols = load_groups_symbols()
-        if groups_symbols:
-            original_count = len(symbols)
-            symbols = filter_by_groups(symbols, groups_symbols)
-            print(f"  Kept {len(symbols)}/{original_count} symbols")
-
-            if not symbols:
-                print("\nNo symbols remaining after filter")
-                sys.exit(0)
-
-    print("\nScreener data fetched successfully!")
 
     # Run forecaster if requested
     if args.forecast:
