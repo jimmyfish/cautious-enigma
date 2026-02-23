@@ -1059,6 +1059,10 @@ class DataFetcher:
                     status=FetchStatus.CONNECTION_ERROR,
                 )
 
+            except AuthenticationError:
+                # Re-raise to stop all processing
+                raise
+
             except Exception as e:
                 task.output_path.touch()
                 return FetchResult(
@@ -1169,10 +1173,15 @@ class SymbolProcessor:
         self,
         session: requests.Session,
         concurrent_fetches: int = 6,
+        stop_event: Optional[threading.Event] = None,
     ):
         self.session = session
         self.concurrent_fetches = concurrent_fetches
         self.fetcher = DataFetcher(session)
+        self._stop_event = stop_event
+
+    def _should_stop(self) -> bool:
+        return self._stop_event is not None and self._stop_event.is_set()
 
     def process(
         self,
@@ -1191,6 +1200,15 @@ class SymbolProcessor:
         Returns:
             SymbolResult with processing outcome
         """
+        if self._should_stop():
+            return SymbolResult(
+                symbol=symbol,
+                success=False,
+                retries=0,
+                failures=0,
+                failed_endpoints=["Skipped: process stopped"],
+            )
+
         log_safe(f"Start Initiate {symbol} ({index}/{total})")
 
         session_mgr = SessionDirectory(symbol)
@@ -1233,6 +1251,13 @@ class SymbolProcessor:
             futures = {executor.submit(self.fetcher.fetch, task): task for task in tasks}
 
             for future in as_completed(futures):
+                # Check stop event - cancel remaining and exit early
+                if self._should_stop():
+                    for f in futures:
+                        f.cancel()
+                    break
+
+                # This will raise AuthenticationError if 401 occurred
                 result = future.result()
                 total_retries += result.retries_used
 
@@ -1285,17 +1310,14 @@ class BatchProcessor:
     ):
         self.session = session
         self.max_concurrent_symbols = max_concurrent_symbols
-        self.processor = SymbolProcessor(session)
+        self._stop_event = threading.Event()
+        self.processor = SymbolProcessor(session, stop_event=self._stop_event)
 
     def process(self, symbols: List[str]) -> BatchResult:
         """
         Process a batch of symbols concurrently.
 
-        Args:
-            symbols: List of stock symbols
-
-        Returns:
-            BatchResult with overall statistics
+        Stops immediately when authentication error (401) is detected.
         """
         total = len(symbols)
         results: List[SymbolResult] = []
@@ -1304,19 +1326,54 @@ class BatchProcessor:
 
         print(f"\nInitiating {total} symbol(s)...\n")
 
+        self._stop_event.clear()
+        symbol_queue = list(enumerate(symbols, 1))
+        queue_index = 0
+
         with ThreadPoolExecutor(max_workers=self.max_concurrent_symbols) as executor:
-            futures: Dict[Future, str] = {}
+            pending: Dict[Future, Tuple[str, int]] = {}
 
-            for i, symbol in enumerate(symbols, 1):
+            # Submit initial batch
+            while queue_index < len(symbol_queue) and len(pending) < self.max_concurrent_symbols:
+                i, symbol = symbol_queue[queue_index]
                 future = executor.submit(self.processor.process, symbol, i, total)
-                futures[future] = symbol
+                pending[future] = (symbol, i)
+                queue_index += 1
 
-            for future in as_completed(futures):
-                result = future.result()
-                results.append(result)
-                total_retries += result.retries
-                if not result.success:
-                    total_failed += 1
+            while pending:
+                # Wait for first completion
+                done_futures = [f for f in pending if f.done()]
+                if not done_futures:
+                    time.sleep(0.05)
+                    continue
+
+                for future in done_futures:
+                    symbol, idx = pending.pop(future)
+
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        total_retries += result.retries
+                        if not result.success:
+                            total_failed += 1
+                    except AuthenticationError:
+                        self._stop_event.set()
+                        log_safe(
+                            "Authentication failed (401). Stopping all processing...",
+                            logging.ERROR
+                        )
+                        # Cancel all pending futures
+                        for f in pending:
+                            f.cancel()
+                        pending.clear()
+                        raise
+
+                    # Submit next if not stopped
+                    if not self._stop_event.is_set() and queue_index < len(symbol_queue):
+                        i, symbol = symbol_queue[queue_index]
+                        future = executor.submit(self.processor.process, symbol, i, total)
+                        pending[future] = (symbol, i)
+                        queue_index += 1
 
         return BatchResult(
             total=total,
