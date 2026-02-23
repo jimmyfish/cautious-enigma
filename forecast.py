@@ -33,6 +33,7 @@ from modules import (
     GROUPS_FILE,
     load_groups,
     find_group_for_symbol,
+    SourcesDB,
 )
 from modules.idx_rules import (
     add_ara_arb_features,
@@ -59,15 +60,31 @@ warnings.filterwarnings("ignore")
 
 class MarketAlphaEngine:
     """
-    Extract alpha-generating features from analysis-data-*.json files.
+    Extract alpha-generating features from session data.
     Based on institutional trading patterns and order flow analysis.
+
+    Now reads from SQLite database instead of JSON files.
     """
 
-    def __init__(self, base_path: str = "sources"):
+    def __init__(self, base_path: str = "sources", db: Optional[SourcesDB] = None):
         self.base_path = Path(base_path)
+        self._db = db
+        self._owns_db = db is None
+
+    def _get_db(self) -> SourcesDB:
+        """Get or create database connection."""
+        if self._db is None:
+            self._db = SourcesDB()
+        return self._db
+
+    def close(self) -> None:
+        """Close database connection if we own it."""
+        if self._owns_db and self._db is not None:
+            self._db.close()
+            self._db = None
 
     def load_json(self, filepath: Path) -> Optional[dict]:
-        """Load a JSON file safely."""
+        """Load a JSON file safely (legacy method for backward compatibility)."""
         try:
             with open(filepath, "r") as f:
                 return json.load(f)
@@ -84,14 +101,26 @@ class MarketAlphaEngine:
             return float(value.replace(",", "").replace(" ", "") or 0)
         return 0.0
 
+    def extract_session_features_from_dict(self, symbol: str, session_num: int, analysis: dict) -> Optional[Dict]:
+        """Extract all alpha features from an analyzed dict (from SQLite)."""
+        if not analysis:
+            return None
+
+        return self._extract_features(symbol, str(session_num), analysis)
+
     def extract_session_features(self, symbol: str, session: str) -> Optional[Dict]:
-        """Extract all alpha features from analyzed.json."""
+        """Extract all alpha features from analyzed.json (legacy file-based method)."""
         session_path = self.base_path / symbol / session
 
         # Load analyzed.json
         analysis = self.load_json(session_path / "analyzed.json")
         if not analysis:
             return None
+
+        return self._extract_features(symbol, session, analysis)
+
+    def _extract_features(self, symbol: str, session: str, analysis: dict) -> Optional[Dict]:
+        """Extract alpha features from an analysis dict."""
 
         # Extract price data from price_feed section
         pf = analysis.get("price_feed", {})
@@ -230,25 +259,24 @@ class MarketAlphaEngine:
         }
 
     def load_symbol_data(self, symbol: str, verbose: bool = True) -> pd.DataFrame:
-        """Load all session data for a symbol."""
-        symbol_path = self.base_path / symbol
-        if not symbol_path.exists():
-            raise ValueError(f"Symbol not found: {symbol}")
-
-        sessions = [d.name for d in symbol_path.iterdir() if d.is_dir()]
-        sessions = sorted(sessions, key=lambda x: int(x) if x.isdigit() else 0)
+        """Load all session data for a symbol from SQLite."""
+        db = self._get_db()
+        sessions = db.get_sessions(symbol)
 
         if not sessions:
             raise ValueError(f"No sessions found for: {symbol}")
 
         features_list = []
-        for session in sessions:
-            features = self.extract_session_features(symbol, session)
+        for session_data in sessions:
+            session_num = session_data["session"]
+            analyzed = session_data["analyzed"]
+
+            features = self.extract_session_features_from_dict(symbol, session_num, analyzed)
             if features:
                 features_list.append(features)
                 if verbose:
                     print(
-                        f"  Session {session}: close={features['y']:,.0f}, OBI={features['obi']:.3f}, "
+                        f"  Session {session_num}: close={features['y']:,.0f}, OBI={features['obi']:.3f}, "
                         f"BuyConc={features['buy_concentration']:.2f}, ForeignNet={features['foreign_net']:,.0f}"
                     )
 
@@ -263,16 +291,16 @@ class MarketAlphaEngine:
     def load_group_data(self, symbols: List[str]) -> pd.DataFrame:
         """Load data for multiple symbols (for group training)."""
         all_data = []
-        available = self.get_available_symbols()
+        available = set(self.get_available_symbols())
 
         for symbol in symbols:
-            if symbol not in available:
-                print(f"  Warning: {symbol} not found in sources, skipping")
+            if symbol.upper() not in available:
+                print(f"  Warning: {symbol} not found in database, skipping")
                 continue
 
             try:
                 print(f"\n  Loading {symbol}...")
-                df = self.load_symbol_data(symbol, verbose=False)
+                df = self.load_symbol_data(symbol.upper(), verbose=False)
                 all_data.append(df)
                 print(f"    {len(df)} sessions loaded")
             except ValueError as e:
@@ -288,10 +316,9 @@ class MarketAlphaEngine:
         return combined
 
     def get_available_symbols(self) -> List[str]:
-        """Get list of available symbols."""
-        if not self.base_path.exists():
-            return []
-        return [d.name for d in self.base_path.iterdir() if d.is_dir()]
+        """Get list of available symbols from SQLite database."""
+        db = self._get_db()
+        return db.get_symbols()
 
 
 class TickDataProcessor:
@@ -401,7 +428,8 @@ class StockForecaster:
         self.nf = None
 
         # Use group name for model path if training with group
-        model_name = f"group_{group}" if group else f"forecast_{symbol}"
+        # Include horizon in path so different horizons are cached separately
+        model_name = f"group_{group}_h{horizon}" if group else f"forecast_{symbol}_h{horizon}"
         self.model_path = MODELS_DIR / model_name
         self.meta_path = MODELS_DIR / f"{model_name}_meta.json"
 
@@ -727,6 +755,15 @@ class StockForecaster:
         saved_meta = None if force_retrain else self.load_model()
         use_fine_tuning = False
         max_steps = 200
+
+        if saved_meta is not None:
+            saved_horizon = saved_meta.get("horizon", 0)
+            if saved_horizon != self.horizon:
+                print(
+                    f"\n  Horizon changed: {saved_horizon} -> {self.horizon}"
+                )
+                print("  Strategy: Retraining from scratch (architecture mismatch)")
+                saved_meta = None
 
         if saved_meta is not None:
             prev_count = saved_meta.get("data_count", 0)

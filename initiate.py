@@ -20,7 +20,9 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
@@ -44,6 +46,7 @@ from modules import (
     SOURCES_DIR,
     setup_logging,
     load_groups,
+    SourcesDB,
 )
 
 load_dotenv()
@@ -380,54 +383,70 @@ def save_json_file(path: Path, data: JsonDict, indent: int = 2, atomic: bool = T
         return False
 
 
-class SessionDirectory:
-    def __init__(self, symbol: str, base_dir: Path = SOURCES_DIR):
+class SessionManager:
+    """
+    Manages session data storage using SQLite.
+
+    Replaces the old SessionDirectory class that used file system directories.
+    """
+
+    def __init__(self, symbol: str, db: Optional[SourcesDB] = None):
         self.symbol = symbol.upper()
-        self.base_dir = base_dir / self.symbol
-        self._counter_file = self.base_dir / ".last_session"
+        self._db = db
+        self._owns_db = db is None
+
+    def _get_db(self) -> SourcesDB:
+        if self._db is None:
+            self._db = SourcesDB()
+        return self._db
+
+    def get_next_session_number(self) -> int:
+        """Get the next session number for this symbol."""
+        return self._get_db().get_next_session_number(self.symbol)
+
+    def get_latest_session(self) -> Optional[JsonDict]:
+        """Get the latest session data for this symbol."""
+        return self._get_db().get_latest_session(self.symbol)
+
+    def has_data_for_date(self, date: str) -> bool:
+        """Check if data exists for this symbol on the given date."""
+        return self._get_db().has_data_for_date(self.symbol, date)
+
+    def save_session(
+        self,
+        session: int,
+        date: str,
+        analyzed: JsonDict,
+        running_trade: Optional[JsonDict] = None,
+    ) -> int:
+        """Save session data to the database."""
+        return self._get_db().insert_session(
+            self.symbol, session, date, analyzed, running_trade
+        )
+
+    def create_temp_dir(self) -> Path:
+        """Create a temporary directory for fetching API data."""
+        temp_dir = Path(tempfile.mkdtemp(prefix=f"initiate_{self.symbol}_"))
+        return temp_dir
+
+    def close(self) -> None:
+        """Close the database connection if we own it."""
+        if self._owns_db and self._db is not None:
+            self._db.close()
+            self._db = None
+
+
+# Legacy alias for backward compatibility
+class SessionDirectory(SessionManager):
+    """Deprecated: Use SessionManager instead."""
+
+    def __init__(self, symbol: str, base_dir: Path = SOURCES_DIR):
+        super().__init__(symbol)
+        self.base_dir = base_dir / symbol.upper()
 
     def get_next_session(self) -> Path:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        next_num = self._read_counter()
-        if next_num is None:
-            next_num = self._scan_directories()
-        session_dir = self.base_dir / str(next_num)
-        session_dir.mkdir(parents=True, exist_ok=True)
-        self._write_counter(next_num)
-        return session_dir
-
-    def get_latest_session(self) -> Optional[Path]:
-        if not self.base_dir.exists():
-            return None
-        session_dirs = [
-            d for d in self.base_dir.iterdir()
-            if d.is_dir() and d.name.isdigit()
-        ]
-        if not session_dirs:
-            return None
-        return max(session_dirs, key=lambda d: int(d.name))
-
-    def _read_counter(self) -> Optional[int]:
-        if not self._counter_file.exists():
-            return None
-
-        try:
-            return int(self._counter_file.read_text().strip()) + 1
-        except (ValueError, OSError):
-            return None
-
-    def _scan_directories(self) -> int:
-        numbers = [
-            int(p.name) for p in self.base_dir.iterdir()
-            if p.is_dir() and p.name.isdigit()
-        ]
-        return (max(numbers) + 1) if numbers else 1
-
-    def _write_counter(self, num: int) -> None:
-        try:
-            self._counter_file.write_text(str(num))
-        except OSError:
-            pass
+        """Legacy method - returns a temp directory for API fetches."""
+        return self.create_temp_dir()
 
 def summarize_depth(data: JsonDict) -> Dict[str, JsonDict]:
     pf = data.get("data", {})
@@ -905,6 +924,7 @@ class AnalysisBuilder:
         }
 
     def generate(self) -> Optional[Path]:
+        """Generate analysis and save to file (legacy file-based method)."""
         try:
             summary = self.build()
             output_path = self.session_dir / "analyzed.json"
@@ -912,6 +932,35 @@ class AnalysisBuilder:
             if save_json_file(output_path, summary):
                 return output_path
             return None
+
+        except Exception as e:
+            logger.error(f"Analysis generation failed: {e}")
+            return None
+
+    def generate_for_db(self) -> Optional[Tuple[JsonDict, Optional[JsonDict], str]]:
+        """
+        Generate analysis data for SQLite storage.
+
+        Returns:
+            Tuple of (analyzed_dict, running_trade_dict, date) or None if failed
+        """
+        try:
+            summary = self.build()
+
+            # Load running trade data
+            running_trade_path = self.session_dir / "today-running-trade.json"
+            running_trade = load_json_file(running_trade_path)
+
+            # Extract date from summary
+            time_horizons = summary.get("metadata", {}).get("time_horizons", {})
+            date = (
+                time_horizons.get("market_detector", {}).get("to")
+                or time_horizons.get("price_feed", {}).get("date")
+                or time_horizons.get("findata", {}).get("to")
+                or datetime.now().strftime("%Y-%m-%d")
+            )
+
+            return summary, running_trade, date
 
         except Exception as e:
             logger.error(f"Analysis generation failed: {e}")
@@ -935,6 +984,13 @@ class AnalysisBuilder:
                     pass
 
         return deleted_count
+
+    def cleanup_temp_dir(self) -> None:
+        """Remove the temporary session directory completely."""
+        try:
+            shutil.rmtree(self.session_dir)
+        except OSError:
+            pass
 
 class DataFetcher:
 
@@ -1125,7 +1181,8 @@ class MarketHolidayChecker:
 
 def has_existing_data(
     symbol: str,
-    target_date: Optional[str] = None
+    target_date: Optional[str] = None,
+    db: Optional[SourcesDB] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Check if data for target date already exists for a symbol.
@@ -1133,6 +1190,7 @@ def has_existing_data(
     Args:
         symbol: Stock symbol
         target_date: Date to check (YYYY-MM-DD). Defaults to today.
+        db: Optional database connection to reuse
 
     Returns:
         (has_data, data_date)
@@ -1140,29 +1198,29 @@ def has_existing_data(
     if target_date is None:
         target_date = date.today().strftime("%Y-%m-%d")
 
-    session_mgr = SessionDirectory(symbol)
-    latest_session = session_mgr.get_latest_session()
-
-    if not latest_session:
-        return False, None
-
-    analyzed_file = latest_session / "analyzed.json"
-    if not analyzed_file.exists():
-        return False, None
-
     try:
-        analysis = load_json_file(analyzed_file)
-        if not analysis:
+        # Use provided db or create a new one
+        if db is not None:
+            has_data = db.has_data_for_date(symbol, target_date)
+            if has_data:
+                return True, target_date
+
+            # Check latest session date
+            latest = db.get_latest_session(symbol)
+            if latest:
+                return False, latest.get("date")
             return False, None
+        else:
+            with SourcesDB() as db_conn:
+                has_data = db_conn.has_data_for_date(symbol, target_date)
+                if has_data:
+                    return True, target_date
 
-        pf_date = (
-            analysis.get("metadata", {})
-            .get("time_horizons", {})
-            .get("price_feed", {})
-            .get("date")
-        )
-
-        return pf_date == target_date, pf_date
+                # Check latest session date
+                latest = db_conn.get_latest_session(symbol)
+                if latest:
+                    return False, latest.get("date")
+                return False, None
 
     except Exception:
         return False, None
@@ -1174,14 +1232,21 @@ class SymbolProcessor:
         session: requests.Session,
         concurrent_fetches: int = 6,
         stop_event: Optional[threading.Event] = None,
+        db: Optional[SourcesDB] = None,
     ):
         self.session = session
         self.concurrent_fetches = concurrent_fetches
         self.fetcher = DataFetcher(session)
         self._stop_event = stop_event
+        self._db = db
 
     def _should_stop(self) -> bool:
         return self._stop_event is not None and self._stop_event.is_set()
+
+    def _get_db(self) -> SourcesDB:
+        if self._db is None:
+            self._db = SourcesDB()
+        return self._db
 
     def process(
         self,
@@ -1191,6 +1256,8 @@ class SymbolProcessor:
     ) -> SymbolResult:
         """
         Process a single symbol.
+
+        Fetches data from API, builds analysis, and saves to SQLite database.
 
         Args:
             symbol: Stock symbol
@@ -1211,11 +1278,17 @@ class SymbolProcessor:
 
         log_safe(f"Start Initiate {symbol} ({index}/{total})")
 
-        session_mgr = SessionDirectory(symbol)
-        session_dir = session_mgr.get_next_session()
+        # Get database and session info
+        db = self._get_db()
+        session_mgr = SessionManager(symbol, db)
+        next_session = session_mgr.get_next_session_number()
+
+        # Create temp directory for API fetches
+        temp_dir = session_mgr.create_temp_dir()
 
         if not self.session.headers.get("Authorization"):
-            self._touch_all_files(session_dir)
+            # Clean up temp dir
+            shutil.rmtree(temp_dir, ignore_errors=True)
             log_safe(f"{symbol} Failed ({index}/{total}) - No auth", logging.ERROR)
             return SymbolResult(
                 symbol=symbol,
@@ -1237,7 +1310,7 @@ class SymbolProcessor:
         tasks = [
             FetchTask(
                 url=ep.url_template,
-                output_path=session_dir / ep.filename,
+                output_path=temp_dir / ep.filename,
                 endpoint_name=ep.name,
             )
             for ep in endpoints
@@ -1245,61 +1318,59 @@ class SymbolProcessor:
 
         total_retries = 0
         total_failures = 0
-        failed_endpoints = []
+        failed_endpoints: List[str] = []
 
-        with ThreadPoolExecutor(max_workers=self.concurrent_fetches) as executor:
-            futures = {executor.submit(self.fetcher.fetch, task): task for task in tasks}
+        try:
+            with ThreadPoolExecutor(max_workers=self.concurrent_fetches) as executor:
+                futures = {executor.submit(self.fetcher.fetch, task): task for task in tasks}
 
-            for future in as_completed(futures):
-                # Check stop event - cancel remaining and exit early
-                if self._should_stop():
-                    for f in futures:
-                        f.cancel()
-                    break
+                for future in as_completed(futures):
+                    # Check stop event - cancel remaining and exit early
+                    if self._should_stop():
+                        for f in futures:
+                            f.cancel()
+                        break
 
-                # This will raise AuthenticationError if 401 occurred
-                result = future.result()
-                total_retries += result.retries_used
+                    # This will raise AuthenticationError if 401 occurred
+                    result = future.result()
+                    total_retries += result.retries_used
 
-                if not result.success:
-                    total_failures += 1
-                    failed_endpoints.append(f"{result.endpoint_name}: {result.failure_reason}")
+                    if not result.success:
+                        total_failures += 1
+                        failed_endpoints.append(f"{result.endpoint_name}: {result.failure_reason}")
 
-        builder = AnalysisBuilder(session_dir)
-        analysis_path = builder.generate()
+            # Build analysis and save to SQLite
+            builder = AnalysisBuilder(temp_dir)
+            db_result = builder.generate_for_db()
 
-        if analysis_path:
-            builder.cleanup()
+            analysis_path: Optional[Path] = None
+            if db_result:
+                analyzed, running_trade, data_date = db_result
+                session_mgr.save_session(next_session, data_date, analyzed, running_trade)
+                # Set analysis_path to indicate success (for compatibility)
+                analysis_path = Path(f"sqlite:{symbol}/{next_session}")
 
-        if total_failures == 0:
-            log_safe(f"{symbol} Initiated ({index}/{total})")
-        else:
-            failures_str = " | ".join(failed_endpoints)
-            log_safe(
-                f"{symbol} Initiated ({index}/{total}) [{total_failures} failed: {failures_str}]",
-                logging.WARNING
+            if total_failures == 0:
+                log_safe(f"{symbol} Initiated ({index}/{total})")
+            else:
+                failures_str = " | ".join(failed_endpoints)
+                log_safe(
+                    f"{symbol} Initiated ({index}/{total}) [{total_failures} failed: {failures_str}]",
+                    logging.WARNING
+                )
+
+            return SymbolResult(
+                symbol=symbol,
+                success=total_failures == 0,
+                retries=total_retries,
+                failures=total_failures,
+                failed_endpoints=failed_endpoints,
+                analysis_path=analysis_path,
             )
 
-        return SymbolResult(
-            symbol=symbol,
-            success=total_failures == 0,
-            retries=total_retries,
-            failures=total_failures,
-            failed_endpoints=failed_endpoints,
-            analysis_path=analysis_path,
-        )
-
-    def _touch_all_files(self, session_dir: Path) -> None:
-        files = [
-            "market-detector.json",
-            "price-feed.json",
-            "orderbook.json",
-            "running-trade.json",
-            "today-running-trade.json",
-            "findata.json",
-        ]
-        for filename in files:
-            (session_dir / filename).touch()
+        finally:
+            # Always clean up temp directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 class BatchProcessor:
 
@@ -1311,7 +1382,9 @@ class BatchProcessor:
         self.session = session
         self.max_concurrent_symbols = max_concurrent_symbols
         self._stop_event = threading.Event()
-        self.processor = SymbolProcessor(session, stop_event=self._stop_event)
+        # Create shared database connection for all processors
+        self._db = SourcesDB()
+        self.processor = SymbolProcessor(session, stop_event=self._stop_event, db=self._db)
 
     def process(self, symbols: List[str]) -> BatchResult:
         """
@@ -1374,6 +1447,9 @@ class BatchProcessor:
                         future = executor.submit(self.processor.process, symbol, i, total)
                         pending[future] = (symbol, i)
                         queue_index += 1
+
+        # Close database connection
+        self._db.close()
 
         return BatchResult(
             total=total,

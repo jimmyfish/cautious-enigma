@@ -44,6 +44,7 @@ from modules import (
     setup_logging,
     load_groups,
     find_group_for_symbol,
+    SourcesDB,
 )
 from modules.idx_rules import calculate_ara_arb
 from modules.watchlist import (
@@ -208,18 +209,35 @@ def _safe_last(series: pd.Series, default: Any = None) -> Any:
 
 
 class TickToOHLCV:
-    """Convert tick-level trade data to OHLCV bars."""
+    """Convert tick-level trade data to OHLCV bars.
+
+    Now reads from SQLite database instead of JSON files.
+    """
 
     # Feature columns for forecasting
     EXOG_COLUMNS: List[str] = [
         "volume", "volatility", "buy_pressure", "foreign_net", "momentum", "vol_ratio"
     ]
 
-    def __init__(self, base_path: Union[str, Path] = SOURCES_DIR):
+    def __init__(self, base_path: Union[str, Path] = SOURCES_DIR, db: Optional[SourcesDB] = None):
         self.base_path = Path(base_path)
+        self._db = db
+        self._owns_db = db is None
+
+    def _get_db(self) -> SourcesDB:
+        """Get or create database connection."""
+        if self._db is None:
+            self._db = SourcesDB()
+        return self._db
+
+    def close(self) -> None:
+        """Close database connection if we own it."""
+        if self._owns_db and self._db is not None:
+            self._db.close()
+            self._db = None
 
     def _load_json(self, filepath: Path) -> Optional[Dict]:
-        """Load JSON file with error handling."""
+        """Load JSON file with error handling (legacy method)."""
         try:
             with filepath.open("r") as f:
                 return json.load(f)
@@ -239,8 +257,12 @@ class TickToOHLCV:
         return pd.Series(result).fillna(0.0)
 
     def _get_session_date(self, session_path: Path) -> datetime:
-        """Extract date from analyzed.json file."""
+        """Extract date from analyzed.json file (legacy method)."""
         analysis = self._load_json(session_path / "analyzed.json")
+        return self._extract_date_from_analysis(analysis)
+
+    def _extract_date_from_analysis(self, analysis: Optional[Dict]) -> datetime:
+        """Extract date from analysis dict."""
         if analysis:
             time_horizons = analysis.get("metadata", {}).get("time_horizons", {})
             md_to = time_horizons.get("market_detector", {}).get("to")
@@ -373,38 +395,45 @@ class TickToOHLCV:
     def load_session(
         self, symbol: str, session: str, interval: int = DEFAULT_INTERVAL
     ) -> pd.DataFrame:
-        """Load and process a single session from today-running-trade.json."""
-        session_path = self.base_path / symbol / session
-        trt_path = session_path / "today-running-trade.json"
+        """Load and process a single session from SQLite database."""
+        db = self._get_db()
+        session_num = int(session) if session.isdigit() else 0
 
-        if not trt_path.exists():
+        session_data = db.get_session(symbol.upper(), session_num)
+        if not session_data:
             return pd.DataFrame()
 
-        base_date = self._get_session_date(session_path)
+        analyzed = session_data.get("analyzed")
+        running_trade = session_data.get("running_trade")
 
-        trt = self._load_json(trt_path)
-        if trt and "data" in trt:
-            trades = trt["data"].get("running_trade", [])
-            if trades:
-                tick_df = self._parse_trades_vectorized(trades, base_date)
-                if not tick_df.empty:
-                    return self._aggregate_bars(tick_df, interval)
+        if not running_trade:
+            return pd.DataFrame()
+
+        base_date = self._extract_date_from_analysis(analyzed)
+
+        # running_trade structure: {"data": {"running_trade": [...]}}
+        if isinstance(running_trade, dict) and "data" in running_trade:
+            trades = running_trade["data"].get("running_trade", [])
+        else:
+            trades = []
+
+        if trades:
+            tick_df = self._parse_trades_vectorized(trades, base_date)
+            if not tick_df.empty:
+                return self._aggregate_bars(tick_df, interval)
 
         return pd.DataFrame()
 
     def get_symbols(self) -> List[str]:
-        """Get list of available symbols."""
-        if not self.base_path.exists():
-            return []
-        return [d.name for d in self.base_path.iterdir() if d.is_dir()]
+        """Get list of available symbols from SQLite database."""
+        db = self._get_db()
+        return db.get_symbols()
 
     def get_sessions(self, symbol: str) -> List[str]:
-        """Get list of available sessions for a symbol."""
-        path = self.base_path / symbol
-        if not path.exists():
-            return []
-        sessions = [d.name for d in path.iterdir() if d.is_dir()]
-        return sorted(sessions, key=lambda x: int(x) if x.isdigit() else 0)
+        """Get list of available sessions for a symbol from SQLite database."""
+        db = self._get_db()
+        session_nums = db.get_session_numbers(symbol.upper())
+        return [str(s) for s in session_nums]
 
     def load_group_session(
         self, symbols: List[str], session: str, interval: int = DEFAULT_INTERVAL
@@ -414,23 +443,24 @@ class TickToOHLCV:
         available = set(self.get_symbols())
 
         for symbol in symbols:
-            if symbol not in available:
+            symbol_upper = symbol.upper()
+            if symbol_upper not in available:
                 logger.debug(f"Symbol {symbol} not available")
                 continue
 
-            sessions = self.get_sessions(symbol)
+            sessions = self.get_sessions(symbol_upper)
             if session not in sessions:
                 logger.debug(f"Session {session} not found for {symbol}")
                 continue
 
             try:
-                df = self.load_session(symbol, session, interval)
+                df = self.load_session(symbol_upper, session, interval)
                 if not df.empty:
-                    df["unique_id"] = symbol
+                    df["unique_id"] = symbol_upper
                     all_data.append(df)
-                    logger.info(f"  {symbol}: {len(df)} bars")
+                    logger.info(f"  {symbol_upper}: {len(df)} bars")
             except Exception as e:
-                logger.warning(f"  {symbol}: Error - {e}")
+                logger.warning(f"  {symbol_upper}: Error - {e}")
                 continue
 
         if not all_data:
