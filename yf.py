@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from neuralforecast import NeuralForecast
-from neuralforecast.models import NBEATS, NHITS, LSTM
+from neuralforecast.models import NBEATS, NHITS, TFT
 
 # Shared utilities
 from modules import (
@@ -85,7 +85,7 @@ DEFAULT_HORIZON: Final[int] = 5
 DEFAULT_INTERVAL: Final[str] = "1d"
 DEFAULT_PERIOD: Final[str] = "3mo"
 MIN_DATA_POINTS: Final[int] = 10
-MAX_TRAINING_STEPS: Final[int] = 500
+MAX_TRAINING_STEPS: Final[int] = 300
 EARLY_STOP_PATIENCE: Final[int] = 50
 VAL_CHECK_STEPS: Final[int] = 25
 RANDOM_SEED: Final[int] = 42
@@ -552,7 +552,7 @@ class YFinanceForecaster:
                 early_stop_patience_steps=EARLY_STOP_PATIENCE,
                 val_check_steps=VAL_CHECK_STEPS,
             ),
-            LSTM(
+            TFT(
                 h=self.horizon,
                 input_size=input_size,
                 max_steps=self.max_steps,
@@ -561,6 +561,8 @@ class YFinanceForecaster:
                 hist_exog_list=features if features else None,
                 early_stop_patience_steps=EARLY_STOP_PATIENCE,
                 val_check_steps=VAL_CHECK_STEPS,
+                hidden_size=64,
+                n_head=4,
             ),
         ]
 
