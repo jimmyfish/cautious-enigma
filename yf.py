@@ -70,8 +70,10 @@ from modules.telegram import (
     validate_telegram_args,
 )
 
-# Suppress warnings
+# Suppress warnings and verbose training output
 warnings.filterwarnings("ignore")
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
 
 # =============================================================================
 # Configuration & Constants
@@ -541,6 +543,7 @@ class YFinanceForecaster:
                 random_seed=RANDOM_SEED,
                 early_stop_patience_steps=EARLY_STOP_PATIENCE,
                 val_check_steps=VAL_CHECK_STEPS,
+                enable_progress_bar=False,
             ),
             NHITS(
                 h=self.horizon,
@@ -551,6 +554,7 @@ class YFinanceForecaster:
                 hist_exog_list=features if features else None,
                 early_stop_patience_steps=EARLY_STOP_PATIENCE,
                 val_check_steps=VAL_CHECK_STEPS,
+                enable_progress_bar=False,
             ),
             TFT(
                 h=self.horizon,
@@ -563,6 +567,7 @@ class YFinanceForecaster:
                 val_check_steps=VAL_CHECK_STEPS,
                 hidden_size=64,
                 n_head=4,
+                enable_progress_bar=False,
             ),
         ]
 
