@@ -686,6 +686,7 @@ class StockForecaster:
                 loss=DistributionLoss(distribution="StudentT", level=[80, 90]),
                 random_seed=42,
                 start_padding_enabled=True,
+                enable_progress_bar=False,
             ),
             # NBEATS: Interpretable basis decomposition with HuberLoss
             # HuberLoss is robust to outliers (combines MSE + MAE)
@@ -697,6 +698,7 @@ class StockForecaster:
                 loss=HuberLoss(),
                 random_seed=42,
                 start_padding_enabled=True,
+                enable_progress_bar=False,
             ),
             # NHITS: Multi-scale hierarchical with HuberLoss
             NHITS(
@@ -707,6 +709,7 @@ class StockForecaster:
                 loss=HuberLoss(),
                 random_seed=42,
                 start_padding_enabled=True,
+                enable_progress_bar=False,
             ),
         ]
 
