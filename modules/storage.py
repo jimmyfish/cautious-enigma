@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -87,6 +88,7 @@ class SourcesDB:
         """
         self.db_path = db_path or DEFAULT_DB_PATH
         self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.RLock()
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
@@ -98,34 +100,39 @@ class SourcesDB:
     @contextmanager
     def _get_connection(self) -> Iterator[sqlite3.Connection]:
         """Get a database connection with proper settings."""
-        conn = sqlite3.connect(
-            self.db_path,
-            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
-        )
-        conn.row_factory = sqlite3.Row
-        # Enable JSON1 extension functions
-        conn.execute("PRAGMA journal_mode=WAL")
-        try:
-            yield conn
-        finally:
-            conn.close()
+        with self._lock:
+            conn = sqlite3.connect(
+                self.db_path,
+                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+                timeout=30.0,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                yield conn
+            finally:
+                conn.close()
 
     def _get_persistent_connection(self) -> sqlite3.Connection:
         """Get or create a persistent connection for batch operations."""
-        if self._conn is None:
-            self._conn = sqlite3.connect(
-                self.db_path,
-                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
-            )
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-        return self._conn
+        with self._lock:
+            if self._conn is None:
+                self._conn = sqlite3.connect(
+                    self.db_path,
+                    detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+                    timeout=30.0,
+                    check_same_thread=False,
+                )
+                self._conn.row_factory = sqlite3.Row
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            return self._conn
 
     def close(self) -> None:
         """Close the persistent database connection."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     def __enter__(self) -> "SourcesDB":
         """Context manager entry."""
@@ -164,7 +171,8 @@ class SourcesDB:
         analyzed_json = json.dumps(analyzed, ensure_ascii=False)
         running_trade_json = json.dumps(running_trade, ensure_ascii=False) if running_trade else None
 
-        with self._get_connection() as conn:
+        with self._lock:
+            conn = self._get_persistent_connection()
             cursor = conn.execute(
                 """
                 INSERT OR REPLACE INTO sessions (symbol, session, date, analyzed, running_trade)
