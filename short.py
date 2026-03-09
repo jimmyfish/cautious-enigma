@@ -823,6 +823,7 @@ class SessionForecaster:
                 scaler_type="robust",
                 loss=HuberLoss(),  # type: ignore[arg-type]
                 random_seed=RANDOM_SEED,
+                accelerator="auto",
             ),
             # NHITS with StudentT distribution - probabilistic forecasts with heavy tails
             NHITS(
@@ -832,6 +833,7 @@ class SessionForecaster:
                 scaler_type="robust",
                 loss=DistributionLoss(distribution="StudentT", level=[80, 90]),  # type: ignore[arg-type]
                 random_seed=RANDOM_SEED,
+                accelerator="auto",
             ),
             # LSTM with HuberLoss - robust sequential model
             LSTM(
@@ -841,6 +843,7 @@ class SessionForecaster:
                 scaler_type="robust",
                 loss=HuberLoss(),  # type: ignore[arg-type]
                 random_seed=RANDOM_SEED,
+                accelerator="auto",
             ),
         ]
 

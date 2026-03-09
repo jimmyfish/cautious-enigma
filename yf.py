@@ -534,7 +534,6 @@ class YFinanceForecaster:
     def _create_models(self, input_size: int, features: List[str]) -> List:
         """Create model instances with early stopping and regularization."""
         return [
-            # NBEATS doesn't support exogenous variables
             NBEATS(
                 h=self.horizon,
                 input_size=input_size,
@@ -544,6 +543,7 @@ class YFinanceForecaster:
                 early_stop_patience_steps=EARLY_STOP_PATIENCE,
                 val_check_steps=VAL_CHECK_STEPS,
                 enable_progress_bar=False,
+                accelerator="auto",
             ),
             NHITS(
                 h=self.horizon,
@@ -555,6 +555,7 @@ class YFinanceForecaster:
                 early_stop_patience_steps=EARLY_STOP_PATIENCE,
                 val_check_steps=VAL_CHECK_STEPS,
                 enable_progress_bar=False,
+                accelerator="auto",
             ),
             TFT(
                 h=self.horizon,
@@ -568,6 +569,7 @@ class YFinanceForecaster:
                 hidden_size=64,
                 n_head=4,
                 enable_progress_bar=False,
+                accelerator="auto",
             ),
         ]
 

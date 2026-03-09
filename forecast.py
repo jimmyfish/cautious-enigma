@@ -687,6 +687,7 @@ class StockForecaster:
                 random_seed=42,
                 start_padding_enabled=True,
                 enable_progress_bar=False,
+                accelerator="auto",
             ),
             # NBEATS: Interpretable basis decomposition with HuberLoss
             # HuberLoss is robust to outliers (combines MSE + MAE)
@@ -699,6 +700,7 @@ class StockForecaster:
                 random_seed=42,
                 start_padding_enabled=True,
                 enable_progress_bar=False,
+                accelerator="auto",
             ),
             # NHITS: Multi-scale hierarchical with HuberLoss
             NHITS(
@@ -710,6 +712,7 @@ class StockForecaster:
                 random_seed=42,
                 start_padding_enabled=True,
                 enable_progress_bar=False,
+                accelerator="auto",
             ),
         ]
 
